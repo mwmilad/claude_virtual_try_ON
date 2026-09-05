@@ -1,0 +1,11 @@
+model_root: checkpoints/FLUX.1-Fill-dev
+lora_path: checkpoints/omnitry_v1_clothes.safetensors
+lora_rank: 16
+lora_alpha: 16
+
+object_map: {
+  'top clothes': 'replacing the top cloth',
+  'bottom clothes': 'replacing the bottom cloth',
+  'dress': 'replacing the dress',
+  'shoe': 'replacing the shoe',
+}
