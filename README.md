@@ -115,6 +115,22 @@ Other flags:
 - **`ModuleNotFoundError: omnitry`**: run `./scripts/install.sh` first — it clones the
   upstream model code into `third_party/OmniTry`, which `inference.py` adds to
   `sys.path` at import time.
+- **`Expected types for transformer: ... got omnitry...FluxTransformer2DModel`**: this is
+  a harmless warning from `FluxFillPipeline.from_pretrained`, printed because OmniTry
+  subclasses diffusers' transformer. It doesn't stop the run — the same line appears
+  running upstream's own `gradio_demo.py`.
+- **`--quantize fp8` crashes with `fatal error: Python.h: No such file or directory`**
+  (inside a `ninja`/`nvcc` build of a `quanto_cuda` extension): on Ada GPUs (compute
+  capability 8.9, i.e. the 4090) `optimum-quanto` JIT-compiles a CUDA extension the first
+  time a quantized module is moved to the GPU, and that needs your Python interpreter's
+  dev headers. Install them and retry:
+  ```bash
+  sudo apt-get install -y python3.12-dev   # match your venv's Python version
+  ```
+  `inference.py` now checks for `Python.h`, `nvcc`, and `ninja` up front when
+  `--quantize fp8` is passed and exits with this same guidance instead of a mid-pipeline
+  traceback. If you'd rather not touch system packages, drop `--quantize fp8` and use
+  `--offload sequential` (the default) — slower, but needs no build toolchain.
 
 ## Credit
 

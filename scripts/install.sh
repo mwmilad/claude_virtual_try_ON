@@ -19,6 +19,19 @@ if [ "${GPU_MEM_MB}" -lt 20000 ]; then
   echo "         offload/quantization flags documented in README.md even to fit a 4090." >&2
 fi
 
+echo "== checking build toolchain for optional fp8 quantization (--quantize fp8) =="
+PYVER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PY_INCLUDE_DIR="$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')"
+if [ ! -f "${PY_INCLUDE_DIR}/Python.h" ]; then
+  echo "note: python${PYVER} dev headers not found (${PY_INCLUDE_DIR}/Python.h missing)." >&2
+  echo "      --quantize fp8 JIT-compiles a CUDA extension and needs them. Install with:" >&2
+  echo "        sudo apt-get install -y python${PYVER}-dev" >&2
+  echo "      (--offload sequential without --quantize works fine without this.)" >&2
+fi
+if ! command -v nvcc >/dev/null 2>&1; then
+  echo "note: nvcc not found on PATH -- also required for --quantize fp8 (install the CUDA toolkit)." >&2
+fi
+
 echo "== creating virtualenv (.venv) =="
 python3 -m venv .venv
 # shellcheck disable=SC1091

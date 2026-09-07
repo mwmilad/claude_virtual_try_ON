@@ -71,6 +71,36 @@ def enable_4090_matmul_opts() -> None:
     torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
+def check_quanto_build_toolchain() -> None:
+    """On Ada+ GPUs (compute capability >= 8.9, e.g. the 4090) optimum-quanto
+    auto-upgrades fp8 weights to a hardware-packed 'Marlin' format the first time a
+    quantized module is moved to CUDA, by JIT-compiling a CUDA extension on the spot.
+    That build needs nvcc, a C++ compiler, ninja, and the Python headers for the
+    interpreter currently running -- check for them up front so a missing dependency
+    fails fast with instructions instead of a traceback in the middle of a pipeline
+    call."""
+    import shutil
+    import sysconfig
+
+    problems = []
+    py_include = sysconfig.get_path("include")
+    if not os.path.exists(os.path.join(py_include, "Python.h")):
+        v = sys.version_info
+        problems.append(
+            f"Python.h not found in {py_include} -- install your distro's dev headers "
+            f"for this interpreter, e.g. `sudo apt-get install python{v.major}.{v.minor}-dev`"
+        )
+    if shutil.which("nvcc") is None:
+        problems.append("nvcc not found on PATH -- install the CUDA toolkit matching your driver")
+    if shutil.which("ninja") is None:
+        problems.append("ninja not found on PATH -- pip install ninja")
+    if problems:
+        raise SystemExit(
+            "--quantize fp8 needs to JIT-build optimum-quanto's CUDA extension on this GPU "
+            "(compute capability >= 8.9, e.g. RTX 4090). Missing:\n  - " + "\n  - ".join(problems)
+        )
+
+
 def quantize_fp8(module: torch.nn.Module, name: str) -> None:
     try:
         from optimum.quanto import freeze, qfloat8, quantize
@@ -237,6 +267,13 @@ def main() -> None:
         raise SystemExit("CUDA GPU not found. This script targets an RTX 4090.")
 
     enable_4090_matmul_opts()
+
+    if args.quantize == "fp8":
+        # 4090 = Ada Lovelace = sm_89. Pinning this avoids optimum-quanto's JIT build
+        # compiling for every arch it can see, which is slower and, on multi-GPU/mixed
+        # driver boxes, more likely to hit an unrelated compile error.
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
+        check_quanto_build_toolchain()
 
     if args.seed == -1:
         args.seed = random.randint(0, 2**32 - 1)

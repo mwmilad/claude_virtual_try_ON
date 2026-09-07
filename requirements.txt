@@ -16,5 +16,9 @@ numpy==2.2.6
 tqdm==4.67.1
 
 # fp8 quantization of the transformer / T5 text encoder, used by --quantize fp8
-# to make the whole-model offload path (--offload model) fit a 24GB 4090
+# to make the whole-model offload path (--offload model) fit a 24GB 4090.
+# On first use it JIT-compiles a CUDA extension (Marlin fp8 packing for sm_89) --
+# that needs ninja plus your distro's python3-dev headers and matching CUDA toolkit
+# (see README.md Troubleshooting).
 optimum-quanto>=0.2.4
+ninja
