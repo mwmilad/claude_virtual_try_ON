@@ -18,13 +18,15 @@ safer strategy and offers a faster opt-in one:
 | `--offload`  | `--quantize` | Peak VRAM | Speed | Notes |
 |---|---|---|---|---|
 | `sequential` (default) | `none` | ~8-10GB | slowest | streams weights layer-by-layer, always fits |
-| `model` | `fp8` | ~14-16GB | fastest that fits a 4090 | needs `optimum-quanto` |
+| `model` | `fp8` | ~14-16GB | fastest that fits a 4090 | **EXPERIMENTAL — has produced NaN/black output, see Troubleshooting** |
 | `model` | `none` | ~26GB+ | fast | **will OOM on a 4090**, needs a 28GB+ GPU |
 | `none` | `none` | ~30GB+ | fastest | needs a 28GB+ GPU |
 
-Start with the default (`sequential`, no quantization) to confirm everything works, then
-switch to `--offload model --quantize fp8` for faster iteration once you've validated the
-setup.
+Use the default (`sequential`, no quantization) — it's the only combination confirmed
+correct on a 4090. `--offload model --quantize fp8` fits in less VRAM and runs faster,
+but has produced fully black output from NaN pixels in real testing (`inference.py`
+now detects this and exits with an error rather than silently saving the bad image —
+see Troubleshooting before trying it).
 
 ## 1. Install
 
@@ -72,8 +74,7 @@ python inference.py \
   --person examples/person.jpg \
   --object examples/garment.jpg \
   --class "top clothes" \
-  --output out.png \
-  --offload model --quantize fp8
+  --output out.png
 ```
 
 Valid `--class` values (from `configs/omnitry_v1_unified.yaml`'s `object_map`):
@@ -99,7 +100,8 @@ Other flags:
   their footprint roughly in half so the faster whole-module offload path fits in 24GB.
   Quantization is applied *after* the LoRA adapters are attached, so the LoRA
   up/down-projection weights themselves stay in bf16 (a QLoRA-style split: quantized
-  frozen base + full-precision adapter).
+  frozen base + full-precision adapter). **Experimental — has produced NaN/black output
+  in testing; see Troubleshooting.** Not recommended until root-caused further.
 - **Sequential CPU offload by default** — the one setting guaranteed to fit a 4090
   regardless of quantization, at the cost of per-step PCIe transfer time.
 
@@ -131,6 +133,20 @@ Other flags:
   `--quantize fp8` is passed and exits with this same guidance instead of a mid-pipeline
   traceback. If you'd rather not touch system packages, drop `--quantize fp8` and use
   `--offload sequential` (the default) — slower, but needs no build toolchain.
+- **`--quantize fp8` produces a fully black `output.png`** (confirmed in testing): the run
+  completes with no crash, but diffusers prints `RuntimeWarning: invalid value encountered
+  in cast` from `image_processor.py` right before saving — the decoded image contains
+  `NaN` pixels, which diffusers silently casts to garbage/black instead of erroring.
+  `inference.py` now catches that exact warning and raises a clear `SystemExit` instead
+  of writing the broken PNG. Root cause: fp8-quantizing the transformer and/or the T5
+  text encoder (via `optimum-quanto`) produces `NaN` activations somewhere in this
+  pipeline's forward pass — likely an interaction with the custom monkey-patched LoRA
+  forward (`add_omnitry_lora`'s `hacked_lora_forward`) that OmniTry's dual-adapter setup
+  relies on, which isn't a configuration PEFT/quanto were designed around. **Fix: drop
+  `--quantize fp8` and use `--offload sequential` (the default)** — confirmed correct,
+  just slower. Treat `--quantize fp8` as experimental until this is root-caused further
+  (a next step would be quantizing only the transformer, not the T5 encoder, to narrow
+  down which one is producing the NaNs).
 
 ## Credit
 

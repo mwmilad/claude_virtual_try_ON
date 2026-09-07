@@ -13,20 +13,25 @@ script defaults to the safest option and offers a faster one:
   --quantize fp8                  fp8-quantizes the transformer + T5 text encoder with
                                    optimum-quanto (~12GB for the transformer instead of
                                    ~24GB), freeing enough VRAM for --offload model.
+                                   KNOWN ISSUE: has produced NaN output (a black/garbage
+                                   image, caught and reported by this script rather than
+                                   saved silently) on this pipeline's custom LoRA forward.
+                                   Treat as experimental; --offload sequential is the
+                                   reliable default until this is root-caused.
 
-Example:
+Example (reliable default -- no quantization):
     python inference.py \\
         --person examples/person.jpg \\
         --object examples/garment.jpg \\
         --class "top clothes" \\
-        --output out.png \\
-        --offload model --quantize fp8
+        --output out.png
 """
 import argparse
 import math
 import os
 import random
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -250,7 +255,8 @@ def parse_args():
     parser.add_argument(
         "--quantize", choices=["none", "fp8"], default="none",
         help="fp8-quantize the transformer + T5 text encoder via optimum-quanto to free "
-             "~12GB VRAM, making --offload model fit on a 4090",
+             "~12GB VRAM, making --offload model fit on a 4090. EXPERIMENTAL: has "
+             "produced NaN (black) output on this pipeline -- see README Troubleshooting",
     )
     parser.add_argument(
         "--compile", action="store_true",
@@ -292,17 +298,36 @@ def main() -> None:
     img_cond, mask, tW, tH = prep_images(person, obj, weight_dtype, device)
 
     prompt = cfg.object_map[args.object_class]
-    with torch.no_grad():
-        image = pipeline(
-            prompt=[prompt] * 2,
-            height=tH,
-            width=tW,
-            img_cond=img_cond,
-            mask=mask,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.steps,
-            generator=torch.Generator(device).manual_seed(args.seed),
-        ).images[0]
+    # diffusers silently casts NaN pixels to garbage/black instead of erroring (it emits
+    # "invalid value encountered in cast" as a plain RuntimeWarning and moves on). Catch
+    # that warning here so a NaN output fails loudly with an actionable message instead
+    # of quietly writing a black PNG.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            image = pipeline(
+                prompt=[prompt] * 2,
+                height=tH,
+                width=tW,
+                img_cond=img_cond,
+                mask=mask,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.steps,
+                generator=torch.Generator(device).manual_seed(args.seed),
+            ).images[0]
+
+    if any("invalid value encountered in cast" in str(w.message) for w in caught):
+        hint = (
+            " --quantize fp8 is the likely cause (fp8-quantizing the transformer/T5 can "
+            "produce NaN activations with this pipeline's custom LoRA forward) -- retry "
+            "with --offload sequential and no --quantize flag."
+            if args.quantize == "fp8"
+            else " cause unclear -- try --offload sequential with no --quantize as a known-good baseline."
+        )
+        raise SystemExit(
+            "Generation produced NaN pixels (diffusers cast them to a black/garbage "
+            "image instead of erroring)." + hint
+        )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     image.save(args.output)
