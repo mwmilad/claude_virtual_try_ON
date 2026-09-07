@@ -18,15 +18,20 @@ safer strategy and offers a faster opt-in one:
 | `--offload`  | `--quantize` | Peak VRAM | Speed | Notes |
 |---|---|---|---|---|
 | `sequential` (default) | `none` | ~8-10GB | slowest | streams weights layer-by-layer, always fits |
-| `model` | `fp8` | ~14-16GB | fastest that fits a 4090 | **EXPERIMENTAL — has produced NaN/black output, see Troubleshooting** |
+| `model` | `transformer` | ~14-16GB | **fast, recommended** | fp8-quantizes only the transformer; T5 stays bf16 |
+| `model` | `all` | ~10-12GB | fastest that fits a 4090 | **EXPERIMENTAL / KNOWN BROKEN — fp8-quantizing T5 has produced NaN/black output, see Troubleshooting** |
 | `model` | `none` | ~26GB+ | fast | **will OOM on a 4090**, needs a 28GB+ GPU |
 | `none` | `none` | ~30GB+ | fastest | needs a 28GB+ GPU |
 
-Use the default (`sequential`, no quantization) — it's the only combination confirmed
-correct on a 4090. `--offload model --quantize fp8` fits in less VRAM and runs faster,
-but has produced fully black output from NaN pixels in real testing (`inference.py`
-now detects this and exits with an error rather than silently saving the bad image —
-see Troubleshooting before trying it).
+If `--offload sequential` feels too slow, use **`--offload model --quantize transformer`**:
+it fp8-quantizes only the transformer (the actual VRAM hog) and keeps the T5 text encoder
+in bf16, so it should give you most of the speed of whole-module offload without the NaN
+bug that full fp8 quantization (`--quantize all`) hit in testing — T5 is well known to be
+numerically fragile at reduced precision, which is almost certainly why that combination
+produced NaNs. `--quantize transformer` hasn't been run on real hardware here to confirm
+it's clean either, but it targets the actual suspect; if it still produces NaN output,
+`inference.py` will now catch it and tell you clearly instead of saving a black image
+(see Troubleshooting) — please report back either way.
 
 ## 1. Install
 
@@ -70,11 +75,20 @@ specifically for garments.
 ## 3. Run inference
 
 ```bash
+# safe default (confirmed correct, slower)
 python inference.py \
   --person examples/person.jpg \
   --object examples/garment.jpg \
   --class "top clothes" \
   --output out.png
+
+# faster: fp8 the transformer only, keep T5 in bf16
+python inference.py \
+  --person examples/person.jpg \
+  --object examples/garment.jpg \
+  --class "top clothes" \
+  --output out.png \
+  --offload model --quantize transformer
 ```
 
 Valid `--class` values (from `configs/omnitry_v1_unified.yaml`'s `object_map`):
@@ -95,21 +109,23 @@ Other flags:
   extra dependency (PyTorch ships this; no separate flash-attn build required).
 - **VAE tiling + slicing** always on — shrinks the VAE decode step's peak memory with
   no visible quality impact at the resolutions this pipeline runs at.
-- **fp8 weight-only quantization** (`--quantize fp8`, via `optimum-quanto`) of the
-  transformer and the T5-XXL text encoder — the two largest memory consumers — cutting
-  their footprint roughly in half so the faster whole-module offload path fits in 24GB.
-  Quantization is applied *after* the LoRA adapters are attached, so the LoRA
+- **fp8 weight-only quantization** (`--quantize transformer`, via `optimum-quanto`) of
+  just the transformer — the actual memory hog (~24GB → ~12GB in bf16 vs fp8) — freeing
+  enough VRAM for the faster whole-module offload path (`--offload model`) to fit in
+  24GB. Quantization is applied *after* the LoRA adapters are attached, so the LoRA
   up/down-projection weights themselves stay in bf16 (a QLoRA-style split: quantized
-  frozen base + full-precision adapter). **Experimental — has produced NaN/black output
-  in testing; see Troubleshooting.** Not recommended until root-caused further.
+  frozen base + full-precision adapter). The T5 text encoder is deliberately left in
+  bf16 — `--quantize all` additionally fp8-quantizes it and is **experimental / known
+  broken**: it produced NaN/black output in testing (T5 is numerically fragile at
+  reduced precision). See Troubleshooting.
 - **Sequential CPU offload by default** — the one setting guaranteed to fit a 4090
   regardless of quantization, at the cost of per-step PCIe transfer time.
 
 ## Troubleshooting
 
-- **CUDA OOM**: make sure you're on the default `--offload sequential`, or add
-  `--quantize fp8`. Also try a smaller input image (the pipeline caps resolution at
-  1024×1024 already, rounded to a multiple of 16).
+- **CUDA OOM**: make sure you're on the default `--offload sequential`, or use
+  `--offload model --quantize transformer`. Also try a smaller input image (the pipeline
+  caps resolution at 1024×1024 already, rounded to a multiple of 16).
 - **403 / gated repo error downloading FLUX.1-Fill-dev**: you must request access on the
   model page and run `huggingface-cli login` with a token that has accepted the license.
 - **flash-attn fails to build**: safe to ignore; `inference.py` doesn't depend on it and
@@ -121,32 +137,32 @@ Other flags:
   a harmless warning from `FluxFillPipeline.from_pretrained`, printed because OmniTry
   subclasses diffusers' transformer. It doesn't stop the run — the same line appears
   running upstream's own `gradio_demo.py`.
-- **`--quantize fp8` crashes with `fatal error: Python.h: No such file or directory`**
-  (inside a `ninja`/`nvcc` build of a `quanto_cuda` extension): on Ada GPUs (compute
-  capability 8.9, i.e. the 4090) `optimum-quanto` JIT-compiles a CUDA extension the first
-  time a quantized module is moved to the GPU, and that needs your Python interpreter's
-  dev headers. Install them and retry:
+- **`--quantize transformer`/`all` crashes with `fatal error: Python.h: No such file or
+  directory`** (inside a `ninja`/`nvcc` build of a `quanto_cuda` extension): on Ada GPUs
+  (compute capability 8.9, i.e. the 4090) `optimum-quanto` JIT-compiles a CUDA extension
+  the first time a quantized module is moved to the GPU, and that needs your Python
+  interpreter's dev headers. Install them and retry:
   ```bash
   sudo apt-get install -y python3.12-dev   # match your venv's Python version
   ```
-  `inference.py` now checks for `Python.h`, `nvcc`, and `ninja` up front when
-  `--quantize fp8` is passed and exits with this same guidance instead of a mid-pipeline
-  traceback. If you'd rather not touch system packages, drop `--quantize fp8` and use
+  `inference.py` checks for `Python.h`, `nvcc`, and `ninja` up front whenever
+  `--quantize` isn't `none` and exits with this same guidance instead of a mid-pipeline
+  traceback. If you'd rather not touch system packages, drop `--quantize` and use
   `--offload sequential` (the default) — slower, but needs no build toolchain.
-- **`--quantize fp8` produces a fully black `output.png`** (confirmed in testing): the run
+- **`--quantize all` produces a fully black `output.png`** (confirmed in testing): the run
   completes with no crash, but diffusers prints `RuntimeWarning: invalid value encountered
   in cast` from `image_processor.py` right before saving — the decoded image contains
   `NaN` pixels, which diffusers silently casts to garbage/black instead of erroring.
-  `inference.py` now catches that exact warning and raises a clear `SystemExit` instead
-  of writing the broken PNG. Root cause: fp8-quantizing the transformer and/or the T5
-  text encoder (via `optimum-quanto`) produces `NaN` activations somewhere in this
-  pipeline's forward pass — likely an interaction with the custom monkey-patched LoRA
-  forward (`add_omnitry_lora`'s `hacked_lora_forward`) that OmniTry's dual-adapter setup
-  relies on, which isn't a configuration PEFT/quanto were designed around. **Fix: drop
-  `--quantize fp8` and use `--offload sequential` (the default)** — confirmed correct,
-  just slower. Treat `--quantize fp8` as experimental until this is root-caused further
-  (a next step would be quantizing only the transformer, not the T5 encoder, to narrow
-  down which one is producing the NaNs).
+  `inference.py` catches that exact warning and raises a clear `SystemExit` instead of
+  writing the broken PNG. Root cause: fp8-quantizing the T5 text encoder produces `NaN`
+  activations — T5 is well known to be numerically fragile at reduced precision, and this
+  is almost certainly the same story here, possibly compounded by the custom
+  monkey-patched LoRA forward (`add_omnitry_lora`'s `hacked_lora_forward`) that OmniTry's
+  dual-adapter setup relies on. **Fix: use `--quantize transformer` instead of `all`**
+  (keeps T5 in bf16), or drop `--quantize` entirely and use `--offload sequential`. If
+  `--quantize transformer` *also* produces NaN output, that's a stronger signal the
+  monkey-patched LoRA forward itself doesn't tolerate a quantized base layer — please
+  report it; the interim fix is the same (drop `--quantize`).
 
 ## Credit
 

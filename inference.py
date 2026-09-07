@@ -6,25 +6,26 @@ OmniTry's transformer is FLUX.1-Fill-dev (~11.9B params). In bf16 the weights al
 offload. A 24GB 4090 has no headroom left over for activations at that point, so this
 script defaults to the safest option and offers a faster one:
 
-  --offload sequential (default)  Streams the transformer layer-by-layer to the GPU.
-                                   Fits comfortably under 24GB. Slower per step.
-  --offload model                 Whole submodules moved to GPU on demand (faster).
-                                   On a 4090 this needs --quantize fp8 to fit.
-  --quantize fp8                  fp8-quantizes the transformer + T5 text encoder with
-                                   optimum-quanto (~12GB for the transformer instead of
-                                   ~24GB), freeing enough VRAM for --offload model.
-                                   KNOWN ISSUE: has produced NaN output (a black/garbage
-                                   image, caught and reported by this script rather than
-                                   saved silently) on this pipeline's custom LoRA forward.
-                                   Treat as experimental; --offload sequential is the
-                                   reliable default until this is root-caused.
+  --offload sequential (default)   Streams the transformer layer-by-layer to the GPU.
+                                    Fits comfortably under 24GB. Slowest per step.
+  --offload model                  Whole submodules moved to GPU on demand (faster).
+                                    On a 4090 this needs --quantize transformer to fit.
+  --quantize transformer           fp8-quantizes ONLY the transformer with optimum-quanto
+                                    (~12GB instead of ~24GB), freeing enough VRAM for
+                                    --offload model. The T5 text encoder stays bf16.
+  --quantize all                   fp8-quantizes the transformer AND the T5 text encoder.
+                                    EXPERIMENTAL / KNOWN BROKEN: has produced NaN output
+                                    (a black image, caught and reported rather than saved
+                                    silently) -- T5 is numerically fragile in fp8. Use
+                                    --quantize transformer instead.
 
-Example (reliable default -- no quantization):
+Fast example (fp8 transformer only, T5 stays bf16 -- recommended for speed on a 4090):
     python inference.py \\
         --person examples/person.jpg \\
         --object examples/garment.jpg \\
         --class "top clothes" \\
-        --output out.png
+        --output out.png \\
+        --offload model --quantize transformer
 """
 import argparse
 import math
@@ -101,8 +102,9 @@ def check_quanto_build_toolchain() -> None:
         problems.append("ninja not found on PATH -- pip install ninja")
     if problems:
         raise SystemExit(
-            "--quantize fp8 needs to JIT-build optimum-quanto's CUDA extension on this GPU "
-            "(compute capability >= 8.9, e.g. RTX 4090). Missing:\n  - " + "\n  - ".join(problems)
+            "--quantize (transformer/all) needs to JIT-build optimum-quanto's CUDA extension "
+            "on this GPU (compute capability >= 8.9, e.g. RTX 4090). Missing:\n  - "
+            + "\n  - ".join(problems)
         )
 
 
@@ -111,7 +113,7 @@ def quantize_fp8(module: torch.nn.Module, name: str) -> None:
         from optimum.quanto import freeze, qfloat8, quantize
     except ImportError as exc:
         raise SystemExit(
-            "optimum-quanto is required for --quantize fp8 (pip install optimum-quanto)"
+            "optimum-quanto is required for --quantize transformer/all (pip install optimum-quanto)"
         ) from exc
     print(f"[4090] quantizing {name} to fp8 ...")
     quantize(module, weights=qfloat8)
@@ -181,14 +183,17 @@ def build_pipeline(args, cfg) -> "FluxFillPipeline":
     lora_path = args.lora_path or cfg.lora_path
     add_omnitry_lora(transformer, cfg.lora_rank, cfg.lora_alpha, lora_path)
 
-    if args.quantize == "fp8":
+    if args.quantize in ("transformer", "all"):
         quantize_fp8(transformer, "transformer")
 
     pipeline = FluxFillPipeline.from_pretrained(
         cfg.model_root, transformer=transformer.eval(), torch_dtype=weight_dtype
     )
 
-    if args.quantize == "fp8":
+    if args.quantize == "all":
+        # T5 is numerically fragile in fp8 -- this is the combination that has produced
+        # NaN/black output in testing. Kept opt-in for anyone who wants to experiment
+        # further; --quantize transformer is the recommended fast path.
         quantize_fp8(pipeline.text_encoder_2, "text_encoder_2 (T5)")
 
     # Always on: cheap, no quality cost, meaningfully lowers peak VAE memory.
@@ -248,15 +253,17 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument(
         "--offload", choices=["sequential", "model", "none"], default="sequential",
-        help="sequential = lowest VRAM, safe default on 24GB (default); "
-             "model = faster, needs --quantize fp8 to fit a 4090; "
+        help="sequential = lowest VRAM, safe default on 24GB (default, slowest); "
+             "model = faster, needs --quantize transformer to fit a 4090; "
              "none = no offload, needs a GPU with >=28GB free",
     )
     parser.add_argument(
-        "--quantize", choices=["none", "fp8"], default="none",
-        help="fp8-quantize the transformer + T5 text encoder via optimum-quanto to free "
-             "~12GB VRAM, making --offload model fit on a 4090. EXPERIMENTAL: has "
-             "produced NaN (black) output on this pipeline -- see README Troubleshooting",
+        "--quantize", choices=["none", "transformer", "all"], default="none",
+        help="transformer = fp8-quantize only the transformer via optimum-quanto "
+             "(~12GB instead of ~24GB), enough to make --offload model fit a 4090; "
+             "T5 stays bf16. RECOMMENDED for speed. "
+             "all = also fp8-quantize the T5 text encoder. EXPERIMENTAL/KNOWN BROKEN: "
+             "has produced NaN (black) output -- see README Troubleshooting.",
     )
     parser.add_argument(
         "--compile", action="store_true",
@@ -274,7 +281,7 @@ def main() -> None:
 
     enable_4090_matmul_opts()
 
-    if args.quantize == "fp8":
+    if args.quantize != "none":
         # 4090 = Ada Lovelace = sm_89. Pinning this avoids optimum-quanto's JIT build
         # compiling for every arch it can see, which is slower and, on multi-GPU/mixed
         # driver boxes, more likely to hit an unrelated compile error.
@@ -317,13 +324,20 @@ def main() -> None:
             ).images[0]
 
     if any("invalid value encountered in cast" in str(w.message) for w in caught):
-        hint = (
-            " --quantize fp8 is the likely cause (fp8-quantizing the transformer/T5 can "
-            "produce NaN activations with this pipeline's custom LoRA forward) -- retry "
-            "with --offload sequential and no --quantize flag."
-            if args.quantize == "fp8"
-            else " cause unclear -- try --offload sequential with no --quantize as a known-good baseline."
-        )
+        if args.quantize == "all":
+            hint = (
+                " --quantize all is the likely cause -- fp8-quantizing the T5 text encoder "
+                "is known to produce NaN activations. Retry with --quantize transformer "
+                "(keeps T5 in bf16) or drop --quantize entirely."
+            )
+        elif args.quantize == "transformer":
+            hint = (
+                " unexpected: --quantize transformer (T5 stays bf16) was believed safe. "
+                "Please retry with --quantize none to confirm quantization is the cause, "
+                "and report this -- it means transformer-only fp8 is unstable too."
+            )
+        else:
+            hint = " cause unclear -- try --offload sequential with no --quantize as a known-good baseline."
         raise SystemExit(
             "Generation produced NaN pixels (diffusers cast them to a black/garbage "
             "image instead of erroring)." + hint
