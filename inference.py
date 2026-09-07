@@ -9,23 +9,29 @@ script defaults to the safest option and offers a faster one:
   --offload sequential (default)   Streams the transformer layer-by-layer to the GPU.
                                     Fits comfortably under 24GB. Slowest per step.
   --offload model                  Whole submodules moved to GPU on demand (faster).
-                                    On a 4090 this needs --quantize transformer to fit.
-  --quantize transformer           fp8-quantizes ONLY the transformer with optimum-quanto
-                                    (~12GB instead of ~24GB), freeing enough VRAM for
-                                    --offload model. The T5 text encoder stays bf16.
-  --quantize all                   fp8-quantizes the transformer AND the T5 text encoder.
-                                    EXPERIMENTAL / KNOWN BROKEN: has produced NaN output
-                                    (a black image, caught and reported rather than saved
-                                    silently) -- T5 is numerically fragile in fp8. Use
-                                    --quantize transformer instead.
+                                    Needs ~26GB+ on this pipeline -- OOMs on a 4090.
+  --quantize transformer / all     fp8-quantizes via optimum-quanto to shrink the model
+                                    enough for --offload model to fit a 4090.
+                                    CONFIRMED BROKEN on this pipeline, BOTH modes: fp8
+                                    quantization produces NaN output (caught and reported
+                                    by this script rather than saved as a black image).
+                                    Root cause is unresolved -- likely some of FLUX's
+                                    transformer weights (normalization/modulation layers
+                                    are the usual suspects) overflow fp8's representable
+                                    range during quantization itself. Do not use either
+                                    mode until this is fixed upstream in this repo.
 
-Fast example (fp8 transformer only, T5 stays bf16 -- recommended for speed on a 4090):
+For real speed on a 4090 without quantization, see README "Getting more speed without
+quantization" -- fewer --steps, --compile, and a --max-area override are the verified
+levers; --offload/--quantize are not, right now.
+
+Example (the only combination confirmed correct on a 4090):
     python inference.py \\
         --person examples/person.jpg \\
         --object examples/garment.jpg \\
         --class "top clothes" \\
         --output out.png \\
-        --offload model --quantize transformer
+        --steps 14 --compile
 """
 import argparse
 import math
@@ -191,9 +197,9 @@ def build_pipeline(args, cfg) -> "FluxFillPipeline":
     )
 
     if args.quantize == "all":
-        # T5 is numerically fragile in fp8 -- this is the combination that has produced
-        # NaN/black output in testing. Kept opt-in for anyone who wants to experiment
-        # further; --quantize transformer is the recommended fast path.
+        # Both this and transformer-only quantization are confirmed to produce NaN
+        # output on real 4090 hardware (see README) -- kept opt-in for anyone debugging
+        # the root cause further, not because either mode is currently safe to use.
         quantize_fp8(pipeline.text_encoder_2, "text_encoder_2 (T5)")
 
     # Always on: cheap, no quality cost, meaningfully lowers peak VAE memory.
@@ -213,8 +219,7 @@ def build_pipeline(args, cfg) -> "FluxFillPipeline":
     return pipeline
 
 
-def prep_images(person: Image.Image, obj: Image.Image, weight_dtype, device):
-    max_area = 1024 * 1024
+def prep_images(person: Image.Image, obj: Image.Image, weight_dtype, device, max_area: int):
     oW, oH = person.width, person.height
     ratio = min(1, math.sqrt(max_area / (oW * oH)))
     tW, tH = int(oW * ratio) // 16 * 16, int(oH * ratio) // 16 * 16
@@ -248,22 +253,28 @@ def parse_args():
     parser.add_argument("--output", default="output.png")
     parser.add_argument("--config", default="configs/omnitry_v1_unified.yaml")
     parser.add_argument("--lora-path", default=None, help="override lora_path from the config")
-    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--steps", type=int, default=20, help="fewer steps = faster, some quality cost (try 12-15 for fast iteration)")
     parser.add_argument("--guidance-scale", type=float, default=30)
     parser.add_argument("--seed", type=int, default=-1)
     parser.add_argument(
+        "--max-area", type=int, default=1024 * 1024,
+        help="cap on generated width*height (default 1024*1024=1048576). Lower this "
+             "(e.g. 768*768=589824) for a real, verified speedup at some quality cost -- "
+             "diffusion cost scales with pixel count.",
+    )
+    parser.add_argument(
         "--offload", choices=["sequential", "model", "none"], default="sequential",
-        help="sequential = lowest VRAM, safe default on 24GB (default, slowest); "
-             "model = faster, needs --quantize transformer to fit a 4090; "
-             "none = no offload, needs a GPU with >=28GB free",
+        help="sequential = lowest VRAM, the only mode confirmed correct on a 4090 "
+             "(default, slowest); model = faster but needs ~26GB+ on this pipeline, "
+             "OOMs on a 4090 (--quantize would fit it but is currently broken -- see "
+             "--quantize help); none = no offload, needs a GPU with >=28GB free",
     )
     parser.add_argument(
         "--quantize", choices=["none", "transformer", "all"], default="none",
-        help="transformer = fp8-quantize only the transformer via optimum-quanto "
-             "(~12GB instead of ~24GB), enough to make --offload model fit a 4090; "
-             "T5 stays bf16. RECOMMENDED for speed. "
-             "all = also fp8-quantize the T5 text encoder. EXPERIMENTAL/KNOWN BROKEN: "
-             "has produced NaN (black) output -- see README Troubleshooting.",
+        help="CONFIRMED BROKEN on this pipeline as of now, both 'transformer' and 'all' "
+             "-- fp8 quantization (via optimum-quanto) has produced NaN (black) output "
+             "in real testing on a 4090 for both modes. Do not use until fixed -- see "
+             "README Troubleshooting. Left in place for anyone debugging it further.",
     )
     parser.add_argument(
         "--compile", action="store_true",
@@ -302,7 +313,7 @@ def main() -> None:
     weight_dtype = torch.bfloat16
     person = Image.open(args.person).convert("RGB")
     obj = Image.open(args.object).convert("RGB")
-    img_cond, mask, tW, tH = prep_images(person, obj, weight_dtype, device)
+    img_cond, mask, tW, tH = prep_images(person, obj, weight_dtype, device, args.max_area)
 
     prompt = cfg.object_map[args.object_class]
     # diffusers silently casts NaN pixels to garbage/black instead of erroring (it emits
@@ -324,20 +335,19 @@ def main() -> None:
             ).images[0]
 
     if any("invalid value encountered in cast" in str(w.message) for w in caught):
-        if args.quantize == "all":
+        if args.quantize in ("all", "transformer"):
             hint = (
-                " --quantize all is the likely cause -- fp8-quantizing the T5 text encoder "
-                "is known to produce NaN activations. Retry with --quantize transformer "
-                "(keeps T5 in bf16) or drop --quantize entirely."
-            )
-        elif args.quantize == "transformer":
-            hint = (
-                " unexpected: --quantize transformer (T5 stays bf16) was believed safe. "
-                "Please retry with --quantize none to confirm quantization is the cause, "
-                "and report this -- it means transformer-only fp8 is unstable too."
+                f" --quantize {args.quantize} is the cause -- fp8 quantization is "
+                "confirmed broken on this pipeline (both modes produce NaN in testing). "
+                "Retry with no --quantize flag at all."
             )
         else:
-            hint = " cause unclear -- try --offload sequential with no --quantize as a known-good baseline."
+            hint = (
+                " no --quantize flag was used, so this is a new failure mode -- please "
+                "report it with your exact command. As a baseline, retry with "
+                "--offload sequential --steps 20 --guidance-scale 30 (the values known "
+                "to work) to rule out --guidance-scale, --steps, or --max-area."
+            )
         raise SystemExit(
             "Generation produced NaN pixels (diffusers cast them to a black/garbage "
             "image instead of erroring)." + hint
