@@ -25,10 +25,9 @@ IDM-VTON is the heaviest, most multi-stage pipeline of the three models in this 
 Architecturally it's SDXL-scale (two SDXL UNets + two CLIP text encoders + a CLIP vision
 encoder + VAE), and unlike FitDiT/OmniTry it pulls in `detectron2`/`densepose` as a real
 dependency. `gradio_demo/detectron2` ships as a **prebuilt binary**
-(`_C.cpython-39-x86_64-linux-gnu.so`) rather than source to compile — there's no build
-step, but it only imports under **Python 3.9 exactly**, since that's a real ABI
-constraint baked into the filename, not a suggestion. That Python-version requirement is
-the single most likely source of friction in this setup (see Troubleshooting).
+(`_C.cpython-39-x86_64-linux-gnu.so`) rather than source to compile — no build step, just
+make it importable (see Install below). No specific Python version is required here —
+this has been confirmed working against a regular/default Python install, not just 3.9.
 
 ## Honesty check: what's verified here
 
@@ -60,15 +59,14 @@ cd claude_virtual_try_ON/idm-vton
 ./scripts/install.sh
 ```
 
-This creates `.venv` **using `python3.9` specifically** (required — see above;
-`install.sh` installs it itself via `apt-get` if it's missing and `apt-get` is
-available, otherwise it exits with manual instructions), installs pinned dependencies
-(`torch==2.0.1`/cu118 — upstream's own pin, and cu118 already supports the 4090's Ada
-Lovelace architecture, no bump needed), clones upstream IDM-VTON into
-`third_party/IDM-VTON`, symlinks the vendored `detectron2` — a prebuilt binary, not
-something this script builds — to `./detectron2` (so it's on `sys.path` automatically
-whenever `inference.py`/`train.py` run, no manual `sys.path` handling needed), and
-verifies it actually imports under this venv's Python.
+This creates `.venv` with the regular `python3` on your system (no specific version
+required), installs pinned dependencies (`torch==2.0.1`/cu118 — upstream's own pin, and
+cu118 already supports the 4090's Ada Lovelace architecture, no bump needed), clones
+upstream IDM-VTON into `third_party/IDM-VTON`, symlinks the vendored `detectron2` — a
+prebuilt binary, not something this script builds — to `./detectron2` (so it's on
+`sys.path` automatically whenever `inference.py`/`train.py` run, no manual `sys.path`
+handling needed — this is the confirmed-working way to make it importable), and verifies
+it actually imports.
 
 ## 2. Download checkpoints
 
@@ -177,14 +175,12 @@ Other flags:
   which Python auto-adds to `sys.path` — is the standard, working way to make it
   importable) and checks that it actually imports.
 - **`detectron2` fails to import** (`ImportError`, `undefined symbol`, or a segfault),
-  even after pulling the fix above: the prebuilt `.so` is filename-tagged
-  `cpython-39` — it needs the venv's Python to be **exactly 3.9**, and it likely also
-  needs the installed `torch`/CUDA build to match whatever it was originally linked
-  against (unverified from this environment — no GPU to test). `install.sh` now installs
-  `python3.9` itself via `apt-get` if it's missing (falls back to manual instructions if
-  `apt-get` isn't available) and creates `.venv` with it specifically — if you already
-  have a `.venv` built with a different Python, delete it and rerun `install.sh`
-  (`rm -rf .venv && ./scripts/install.sh`). If it still won't import even under 3.9, the
+  even after pulling the symlink fix above: the prebuilt `.so` is filename-tagged
+  `cpython-39`, but that hasn't been an actual blocker in practice — this setup has been
+  confirmed working with the vendored folder symlinked/copied into place on a regular
+  (non-3.9) Python. If you do hit an import error, it's more likely the installed
+  `torch`/CUDA build not matching whatever the `.so` was originally linked against
+  (unverified from this environment — no GPU to test). If nothing else works, the
   fallback is installing the *official* `detectron2` (not the vendored copy) from source,
   matched to your torch/CUDA build —
   `pip install 'git+https://github.com/facebookresearch/detectron2.git'` — not wired up

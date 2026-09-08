@@ -15,31 +15,7 @@ fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
 echo "== creating virtualenv (.venv) =="
-# Must be exactly Python 3.9: the vendored detectron2 (see below) ships as a PREBUILT
-# binary, third_party/IDM-VTON/gradio_demo/detectron2/_C.cpython-39-*.so -- that
-# filename's cpython-39 tag is a real ABI constraint, not a suggestion. Under any other
-# Python version `import detectron2` fails (ImportError / undefined symbol), not just
-# "might be slower."
-if command -v python3.9 >/dev/null 2>&1; then
-  PYTHON_BIN=python3.9
-elif command -v apt-get >/dev/null 2>&1; then
-  echo "python3.9 not found -- installing it via apt-get (needs sudo)..."
-  sudo apt-get update
-  sudo apt-get install -y python3.9 python3.9-venv
-  if command -v python3.9 >/dev/null 2>&1; then
-    PYTHON_BIN=python3.9
-  else
-    echo "apt-get install completed but python3.9 is still not on PATH -- install it" >&2
-    echo "manually (it may need a package name specific to your distro version) and" >&2
-    echo "re-run this script." >&2
-    exit 1
-  fi
-else
-  echo "python3.9 not found and apt-get isn't available to install it automatically." >&2
-  echo "Install it yourself, e.g. via pyenv: pyenv install 3.9.18" >&2
-  exit 1
-fi
-"$PYTHON_BIN" -m venv .venv
+python3 -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install --upgrade pip
@@ -55,13 +31,12 @@ else
   echo "third_party/IDM-VTON already present, skipping clone"
 fi
 
-echo "== linking vendored detectron2 into idm-vton/ (prebuilt binary, no build step) =="
-echo "   third_party/IDM-VTON/gradio_demo/detectron2 ships a prebuilt _C.cpython-39-*.so"
-echo "   -- there is no setup.py, nothing to 'pip install -e' here. It's modular"
-echo "   (__init__.py everywhere), so it imports fine once it's somewhere Python looks --"
-echo "   symlinked here into this script's own directory (which Python automatically"
-echo "   puts on sys.path when running inference.py/train.py from it) rather than"
-echo "   relying only on the sys.path.insert() inference.py also does for gradio_demo/."
+echo "== linking vendored detectron2 into idm-vton/ (no build step needed) =="
+echo "   third_party/IDM-VTON/gradio_demo/detectron2 is modular (__init__.py"
+echo "   everywhere) and has no setup.py -- there's nothing to 'pip install -e' here."
+echo "   It imports fine once it's somewhere Python looks: symlinked here into this"
+echo "   script's own directory (which Python automatically puts on sys.path when"
+echo "   running inference.py/train.py from it) -- confirmed working this way."
 if [ -e detectron2 ]; then
   echo "detectron2/ already exists here, leaving it as-is"
 else
@@ -73,8 +48,6 @@ if python -c "import detectron2; print('OK:', detectron2.__file__)"; then
   :
 else
   echo "detectron2 failed to import -- see idm-vton/README.md's Troubleshooting section" >&2
-  echo "(most likely cause: this venv isn't exactly Python 3.9, or torch/CUDA here" >&2
-  echo "doesn't match whatever the prebuilt .so was linked against)." >&2
   exit 1
 fi
 
