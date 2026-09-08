@@ -119,6 +119,11 @@ Other flags:
   in `requirements.txt` here (bumped to `numpy==1.26.4`, the closest same-major-version
   release with 3.12 wheels) -- if you still hit this, make sure you've pulled the latest
   `requirements.txt` and re-run `pip install -r requirements.txt` in a clean `.venv`.
+- **`ERROR: Could not find a version that satisfies the requirement
+  onnxruntime-gpu==1.20.1`**: that exact patch release was apparently never published to
+  PyPI, or was pulled (available versions jump `1.20.0` → `1.20.2`). Already fixed in
+  `requirements.txt` here (bumped to `onnxruntime-gpu==1.20.2`) -- pull latest and retry
+  in a clean `.venv` if you still hit this.
 - **CUDA OOM**: step down through `--offload none` → `model` (default) → `aggressive`,
   and/or drop `--resolution` to `768x1024`.
 - **403 / gated repo error downloading the model**: request access on the
