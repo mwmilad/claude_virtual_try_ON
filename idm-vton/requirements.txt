@@ -17,10 +17,11 @@ scipy==1.11.1
 opencv-python
 huggingface_hub==0.26.5
 
-# detectron2/densepose (vendored under third_party/IDM-VTON/gradio_demo/{detectron2,densepose})
-# build-time and runtime deps -- detectron2 itself is installed from that vendored source in
-# install.sh (pip install -e), not from this file, since it needs to compile CUDA ops against
-# the exact torch build above.
+# densepose (vendored under third_party/IDM-VTON/gradio_demo/densepose) runtime deps.
+# detectron2 itself (also vendored, at .../gradio_demo/detectron2) is NOT installed from
+# here or anywhere -- it ships as a prebuilt _C.cpython-39-*.so, imported straight off
+# sys.path (install.sh just checks that it imports; requires this venv's Python to be
+# exactly 3.9, see README.md).
 fvcore
 cloudpickle
 omegaconf

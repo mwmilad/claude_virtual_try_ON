@@ -24,8 +24,11 @@ IDM-VTON is the heaviest, most multi-stage pipeline of the three models in this 
 
 Architecturally it's SDXL-scale (two SDXL UNets + two CLIP text encoders + a CLIP vision
 encoder + VAE), and unlike FitDiT/OmniTry it pulls in `detectron2`/`densepose` as a real
-dependency, which means compiling CUDA ops at install time — the single most likely
-source of friction in this setup (see Troubleshooting).
+dependency. `gradio_demo/detectron2` ships as a **prebuilt binary**
+(`_C.cpython-39-x86_64-linux-gnu.so`) rather than source to compile — there's no build
+step, but it only imports under **Python 3.9 exactly**, since that's a real ABI
+constraint baked into the filename, not a suggestion. That Python-version requirement is
+the single most likely source of friction in this setup (see Troubleshooting).
 
 ## Honesty check: what's verified here
 
@@ -43,8 +46,11 @@ launching a web server as a side effect.
 this setup** (no GPU access in the environment that authored it, and upstream's arXiv
 page and Hugging Face were both unreachable from that environment's network policy, so
 even the paper itself could only be cross-checked via GitHub source, not read directly).
-The vendored `detectron2` build in particular is a well-known friction point for this
-upstream repo in general — please report back what actually works.
+This showed up concretely once real hardware was involved: `install.sh` originally tried
+`pip install -e` on the vendored `detectron2` (assuming it was source to compile), which
+fails immediately — it's actually a prebuilt `.so`, not a package with a `setup.py`. Fixed
+once, but take it as a sign the rest of this setup is still under-tested too — please
+report back what actually works (or doesn't).
 
 ## 1. Install
 
@@ -54,11 +60,12 @@ cd claude_virtual_try_ON/idm-vton
 ./scripts/install.sh
 ```
 
-This creates `.venv`, installs pinned dependencies (`torch==2.0.1`/cu118 — upstream's own
-pin, and cu118 already supports the 4090's Ada Lovelace architecture, no bump needed),
-clones upstream IDM-VTON into `third_party/IDM-VTON`, and builds the vendored
-`detectron2` package at `third_party/IDM-VTON/gradio_demo/detectron2` (needed for
-DensePose) via `pip install -e`.
+This creates `.venv` **using `python3.9` specifically** (required — see above), installs
+pinned dependencies (`torch==2.0.1`/cu118 — upstream's own pin, and cu118 already
+supports the 4090's Ada Lovelace architecture, no bump needed), clones upstream IDM-VTON
+into `third_party/IDM-VTON`, and checks that the vendored `detectron2` at
+`third_party/IDM-VTON/gradio_demo/detectron2` — a prebuilt binary, not something this
+script builds or installs — actually imports under this venv's Python.
 
 ## 2. Download checkpoints
 
@@ -155,13 +162,27 @@ Other flags:
 
 ## Troubleshooting
 
-- **`detectron2` build fails during `install.sh`** (missing `nvcc`, or a CUDA
-  version mismatch): the vendored `detectron2`/`densepose` packages compile CUDA
-  extensions against the installed `torch==2.0.1`+cu118 build. Make sure a matching CUDA
-  toolkit is on `PATH` (e.g. `apt-get install nvidia-cuda-toolkit`, or set `CUDA_HOME` to
-  point at one) and retry `pip install -e third_party/IDM-VTON/gradio_demo/detectron2`.
-  This is a well-known friction point for this upstream repo generally, not something
-  specific to this wrapper.
+- **`ERROR: ... does not appear to be a Python project: neither 'setup.py' nor
+  'pyproject.toml' found`, pointing at `gradio_demo/detectron2`**: this was a real bug in
+  an earlier version of `install.sh`, which wrongly tried `pip install -e` on it.
+  `gradio_demo/detectron2` isn't installable source — it's a **prebuilt binary**
+  (`_C.cpython-39-x86_64-linux-gnu.so`) meant to be imported straight off `sys.path`
+  (`inference.py` already adds `gradio_demo/` to `sys.path` for exactly this). If you're
+  seeing this error, pull the latest `install.sh` — it no longer attempts to install it,
+  just checks that it imports.
+- **`detectron2` fails to import** (`ImportError`, `undefined symbol`, or a segfault),
+  even after pulling the fix above: the prebuilt `.so` is filename-tagged
+  `cpython-39` — it needs the venv's Python to be **exactly 3.9**, and it likely also
+  needs the installed `torch`/CUDA build to match whatever it was originally linked
+  against (unverified from this environment — no GPU to test). `install.sh` now creates
+  `.venv` with `python3.9` specifically and fails fast with install guidance if
+  `python3.9` isn't on `PATH` — if you already have a `.venv` built with a different
+  Python, delete it and rerun `install.sh` (`rm -rf .venv && ./scripts/install.sh`). If
+  it still won't import even under 3.9, the fallback is installing the *official*
+  `detectron2` (not the vendored copy) from source, matched to your torch/CUDA build —
+  `pip install 'git+https://github.com/facebookresearch/detectron2.git'` — not wired up
+  or tested here; you'd also need `densepose` importable (upstream vendors that
+  separately at `gradio_demo/densepose/`, pure Python, should be unaffected by this).
 - **`ModuleNotFoundError: src` / `No module named 'preprocess'` / `No module named
   'apply_net'`**: run `./scripts/install.sh` first — it clones upstream into
   `third_party/IDM-VTON`, which `inference.py` adds to `sys.path` at import time (both

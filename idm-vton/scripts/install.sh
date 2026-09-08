@@ -15,7 +15,21 @@ fi
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
 
 echo "== creating virtualenv (.venv) =="
-python3 -m venv .venv
+# Must be exactly Python 3.9: the vendored detectron2 (see below) ships as a PREBUILT
+# binary, third_party/IDM-VTON/gradio_demo/detectron2/_C.cpython-39-*.so -- that
+# filename's cpython-39 tag is a real ABI constraint, not a suggestion. Under any other
+# Python version `import detectron2` fails (ImportError / undefined symbol), not just
+# "might be slower."
+if command -v python3.9 >/dev/null 2>&1; then
+  PYTHON_BIN=python3.9
+else
+  echo "python3.9 not found on PATH -- required for the vendored detectron2's prebuilt" >&2
+  echo "_C.cpython-39-*.so to import at all. Install it first, e.g.:" >&2
+  echo "  sudo apt-get install python3.9 python3.9-venv   # Debian/Ubuntu" >&2
+  echo "  # or via pyenv: pyenv install 3.9.18" >&2
+  exit 1
+fi
+"$PYTHON_BIN" -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install --upgrade pip
@@ -31,12 +45,23 @@ else
   echo "third_party/IDM-VTON already present, skipping clone"
 fi
 
-echo "== building vendored detectron2 (needed for DensePose preprocessing) =="
-echo "   this compiles CUDA ops and needs nvcc on PATH matching the torch/cu118 build above."
-if python -c "import detectron2" >/dev/null 2>&1; then
-  echo "detectron2 already importable, skipping build"
+echo "== checking the vendored detectron2 imports (prebuilt binary, no build step) =="
+echo "   third_party/IDM-VTON/gradio_demo/detectron2 ships a prebuilt _C.cpython-39-*.so"
+echo "   -- there is no setup.py, nothing to 'pip install -e' here. It works by adding"
+echo "   gradio_demo/ to sys.path (inference.py already does this), so this just"
+echo "   verifies the .so actually loads under this venv's Python."
+if python -c "
+import sys
+sys.path.insert(0, 'third_party/IDM-VTON/gradio_demo')
+import detectron2
+print('OK:', detectron2.__file__)
+"; then
+  :
 else
-  pip install -e third_party/IDM-VTON/gradio_demo/detectron2
+  echo "detectron2 failed to import -- see idm-vton/README.md's Troubleshooting section" >&2
+  echo "(most likely cause: this venv isn't exactly Python 3.9, or torch/CUDA here" >&2
+  echo "doesn't match whatever the prebuilt .so was linked against)." >&2
+  exit 1
 fi
 
 cat <<'EOF'
@@ -53,9 +78,7 @@ Install complete. Next steps:
          --garment-desc "short sleeve round neck t-shirt" \
          --output out.png
 
-If step 3 (detectron2 build) failed: it needs a CUDA toolkit (nvcc) on PATH whose version
-is compatible with the installed torch build (cu118 here) -- e.g. `apt-get install
-nvidia-cuda-toolkit` or point CUDA_HOME at a matching toolkit install. This is a
-well-known friction point for this upstream repo; see idm-vton/README.md's
-Troubleshooting section.
+If the detectron2 import check above failed, see idm-vton/README.md's Troubleshooting
+section -- this is a well-known friction point for this upstream repo in general, not
+something specific to this wrapper.
 EOF
