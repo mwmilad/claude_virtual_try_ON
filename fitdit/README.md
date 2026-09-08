@@ -111,6 +111,14 @@ Other flags:
 
 ## Troubleshooting
 
+- **`numpy` fails to build during `install.sh`** with `AttributeError: module 'pkgutil'
+  has no attribute 'ImpImporter'` (inside a `Getting requirements to build wheel` error
+  for `numpy==1.23.0`): upstream's own pin, `numpy==1.23.0`, predates Python 3.12 --
+  numpy didn't ship `cp312` wheels until `1.26.0`, so pip tries to build 1.23.0 from
+  source, which fails against modern `setuptools`/`pkg_resources` on 3.12. Already fixed
+  in `requirements.txt` here (bumped to `numpy==1.26.4`, the closest same-major-version
+  release with 3.12 wheels) -- if you still hit this, make sure you've pulled the latest
+  `requirements.txt` and re-run `pip install -r requirements.txt` in a clean `.venv`.
 - **CUDA OOM**: step down through `--offload none` → `model` (default) → `aggressive`,
   and/or drop `--resolution` to `768x1024`.
 - **403 / gated repo error downloading the model**: request access on the

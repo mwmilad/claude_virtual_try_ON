@@ -8,7 +8,10 @@ accelerate==0.31.0
 diffusers==0.31.0
 transformers==4.39.3
 gradio==5.8.0
-numpy==1.23.0
+# upstream pins numpy==1.23.0, but numpy didn't ship Python 3.12 wheels until 1.26.0 --
+# 1.23.0 fails to build from source on 3.12 (setuptools/pkg_resources incompatibility).
+# 1.26.4 is the closest same-major-version release with cp312 wheels.
+numpy==1.26.4
 scikit-image==0.24.0
 huggingface_hub==0.26.5
 onnxruntime-gpu==1.20.1
