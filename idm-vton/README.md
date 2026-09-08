@@ -60,12 +60,15 @@ cd claude_virtual_try_ON/idm-vton
 ./scripts/install.sh
 ```
 
-This creates `.venv` **using `python3.9` specifically** (required — see above), installs
-pinned dependencies (`torch==2.0.1`/cu118 — upstream's own pin, and cu118 already
-supports the 4090's Ada Lovelace architecture, no bump needed), clones upstream IDM-VTON
-into `third_party/IDM-VTON`, and checks that the vendored `detectron2` at
-`third_party/IDM-VTON/gradio_demo/detectron2` — a prebuilt binary, not something this
-script builds or installs — actually imports under this venv's Python.
+This creates `.venv` **using `python3.9` specifically** (required — see above;
+`install.sh` installs it itself via `apt-get` if it's missing and `apt-get` is
+available, otherwise it exits with manual instructions), installs pinned dependencies
+(`torch==2.0.1`/cu118 — upstream's own pin, and cu118 already supports the 4090's Ada
+Lovelace architecture, no bump needed), clones upstream IDM-VTON into
+`third_party/IDM-VTON`, symlinks the vendored `detectron2` — a prebuilt binary, not
+something this script builds — to `./detectron2` (so it's on `sys.path` automatically
+whenever `inference.py`/`train.py` run, no manual `sys.path` handling needed), and
+verifies it actually imports under this venv's Python.
 
 ## 2. Download checkpoints
 
@@ -166,20 +169,24 @@ Other flags:
   'pyproject.toml' found`, pointing at `gradio_demo/detectron2`**: this was a real bug in
   an earlier version of `install.sh`, which wrongly tried `pip install -e` on it.
   `gradio_demo/detectron2` isn't installable source — it's a **prebuilt binary**
-  (`_C.cpython-39-x86_64-linux-gnu.so`) meant to be imported straight off `sys.path`
-  (`inference.py` already adds `gradio_demo/` to `sys.path` for exactly this). If you're
-  seeing this error, pull the latest `install.sh` — it no longer attempts to install it,
-  just checks that it imports.
+  (`_C.cpython-39-x86_64-linux-gnu.so`), modular (`__init__.py` throughout) and meant to
+  be imported straight off `sys.path`, not pip-installed. If you're seeing this error,
+  pull the latest `install.sh` — it no longer attempts to install it, just symlinks it to
+  `./detectron2` (confirmed working: symlinking/copying the vendored `detectron2` folder
+  somewhere Python's import machinery already looks — here, this script's own directory,
+  which Python auto-adds to `sys.path` — is the standard, working way to make it
+  importable) and checks that it actually imports.
 - **`detectron2` fails to import** (`ImportError`, `undefined symbol`, or a segfault),
   even after pulling the fix above: the prebuilt `.so` is filename-tagged
   `cpython-39` — it needs the venv's Python to be **exactly 3.9**, and it likely also
   needs the installed `torch`/CUDA build to match whatever it was originally linked
-  against (unverified from this environment — no GPU to test). `install.sh` now creates
-  `.venv` with `python3.9` specifically and fails fast with install guidance if
-  `python3.9` isn't on `PATH` — if you already have a `.venv` built with a different
-  Python, delete it and rerun `install.sh` (`rm -rf .venv && ./scripts/install.sh`). If
-  it still won't import even under 3.9, the fallback is installing the *official*
-  `detectron2` (not the vendored copy) from source, matched to your torch/CUDA build —
+  against (unverified from this environment — no GPU to test). `install.sh` now installs
+  `python3.9` itself via `apt-get` if it's missing (falls back to manual instructions if
+  `apt-get` isn't available) and creates `.venv` with it specifically — if you already
+  have a `.venv` built with a different Python, delete it and rerun `install.sh`
+  (`rm -rf .venv && ./scripts/install.sh`). If it still won't import even under 3.9, the
+  fallback is installing the *official* `detectron2` (not the vendored copy) from source,
+  matched to your torch/CUDA build —
   `pip install 'git+https://github.com/facebookresearch/detectron2.git'` — not wired up
   or tested here; you'd also need `densepose` importable (upstream vendors that
   separately at `gradio_demo/densepose/`, pure Python, should be unaffected by this).
