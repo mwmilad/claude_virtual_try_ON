@@ -1,0 +1,33 @@
+# Pinned per upstream (yisol/IDM-VTON) environment.yaml, translated from conda to pip.
+# torch 2.0.1 + cu118 already supports Ada Lovelace (RTX 4090, sm_89) -- no bump needed,
+# unlike omnitry/ (which needed a newer cu126 wheel for other reasons).
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.0.1
+torchvision==0.15.2
+torchaudio==2.0.2
+
+accelerate==0.25.0
+transformers==4.36.2
+diffusers==0.25.0
+torchmetrics==1.2.1
+tqdm==4.66.1
+einops==0.7.0
+bitsandbytes==0.39.0
+scipy==1.11.1
+opencv-python
+huggingface_hub==0.26.5
+
+# detectron2/densepose (vendored under third_party/IDM-VTON/gradio_demo/{detectron2,densepose})
+# build-time and runtime deps -- detectron2 itself is installed from that vendored source in
+# install.sh (pip install -e), not from this file, since it needs to compile CUDA ops against
+# the exact torch build above.
+fvcore
+cloudpickle
+omegaconf
+pycocotools
+basicsr
+av
+
+# human parsing (preprocess/humanparsing) runs its ONNX models on CPU explicitly
+# (providers=['CPUExecutionProvider'] in upstream's Parsing class) -- no *-gpu variant needed.
+onnxruntime==1.16.2
