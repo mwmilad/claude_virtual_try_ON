@@ -1,0 +1,5 @@
+# fitcontroler/ is a plug-in on top of ../idm-vton -- install that directory's
+# requirements.txt FIRST (torch, diffusers, transformers, detectron2, etc.), then this
+# one, which only adds what's needed for dataset download/loading.
+datasets>=2.19.0
+huggingface_hub>=0.26.5

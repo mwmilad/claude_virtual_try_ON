@@ -150,6 +150,31 @@ class IDMVTONPipeline:
         self.pipe.unet_encoder.to(device)
         self.openpose_model.preprocessor.body_estimation.model.to(device)
 
+    def run_densepose(self, human_img: Image.Image) -> Image.Image:
+        """Runs upstream's DensePose 'show' action (via apply_net.py) on a 768x1024
+        person image, exactly as start_tryon() does. Factored out of run_tryon() so
+        other callers (e.g. ../fitcontroler/train.py, which needs the same DensePose
+        conditioning image when preprocessing training data) can reuse it without
+        duplicating the apply_net argument construction."""
+        human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
+        human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
+
+        densepose_args = apply_net.create_argument_parser().parse_args(
+            (
+                "show",
+                "./configs/densepose_rcnn_R_50_FPN_s1x.yaml",
+                "./ckpt/densepose/model_final_162be9.pkl",
+                "dp_segm",
+                "-v",
+                "--opts",
+                "MODEL.DEVICE",
+                self.device if self.device.startswith("cuda") else "cpu",
+            )
+        )
+        pose_img = densepose_args.func(densepose_args, human_img_arg)
+        pose_img = pose_img[:, :, ::-1]
+        return Image.fromarray(pose_img).resize((768, 1024))
+
     def run_tryon(
         self,
         person_img: Image.Image,
@@ -194,24 +219,7 @@ class IDMVTONPipeline:
         mask_gray_tensor = (1 - self.tensor_transform(mask)) * self.tensor_transform(human_img)
         mask_gray = to_pil_image((mask_gray_tensor + 1.0) / 2.0)
 
-        human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
-        human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
-
-        densepose_args = apply_net.create_argument_parser().parse_args(
-            (
-                "show",
-                "./configs/densepose_rcnn_R_50_FPN_s1x.yaml",
-                "./ckpt/densepose/model_final_162be9.pkl",
-                "dp_segm",
-                "-v",
-                "--opts",
-                "MODEL.DEVICE",
-                device if device.startswith("cuda") else "cpu",
-            )
-        )
-        pose_img = densepose_args.func(densepose_args, human_img_arg)
-        pose_img = pose_img[:, :, ::-1]
-        pose_img = Image.fromarray(pose_img).resize((768, 1024))
+        pose_img = self.run_densepose(human_img)
 
         if on_conditioning_ready is not None:
             # Extension point for plug-ins (e.g. ../fitcontroler) that need to condition

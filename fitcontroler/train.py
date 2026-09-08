@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Training SKELETON for FitControler-on-IDM-VTON. Read this whole docstring first.
+"""Training for FitControler-on-IDM-VTON. Read this whole docstring first.
 
-**This is not a runnable training script.** Two things are missing that no amount of
-code here can supply:
-  1. A real dataset. The paper's own dataset, Fit4Men (~13,000 body-garment pairs of
-     different fits, tops + bottoms), is not publicly released as of when this was
-     written -- `Fit4MenDataset` below defines the *expected sample format* (person
-     photo, garment photo + description, target fit label, ground-truth fit-adjusted
-     mask) and raises NotImplementedError from `__getitem__`, rather than pretending to
-     load data that doesn't exist anywhere.
-  2. Verification on real hardware. This has not been run end-to-end -- no GPU access in
-     the environment that authored it.
+Default dataset: **GarmentCodeVTON** (huggingface.co/datasets/ZenoNing/GarmentCodeVTONDataset,
+from the FitVTON paper, arXiv:2606.12012) -- 78,080 synthetic try-on triplets, used as a
+real, downloadable stand-in for FitControler's own (unreleased) Fit4Men dataset. Run
+`python scripts/download_dataset.py` first, then `python train.py` -- see "Usage" below.
+See fit_datasets.py's module docstring for exactly what's verified vs. guessed about that
+dataset's schema (huggingface.co was unreachable from the environment that wrote this,
+so column names are auto-detected/best-effort, not confirmed).
 
-What this file *does* get right, deliberately: the VTON-diffusion training step (VAE
-encode -> add noise -> garment/reference UNet call -> main UNet call -> MSE loss) is
+**Still not verified on real hardware end-to-end** -- no GPU access in the environment
+that authored this. What *is* grounded, deliberately: the VTON-diffusion training step
+(VAE encode -> add noise -> garment/reference UNet call -> main UNet call -> MSE loss) is
 adapted from upstream IDM-VTON's own `train_xl.py` (fetched and quoted directly from
-https://github.com/yisol/IDM-VTON), not guessed, so if you do have the frozen base
-pipeline loaded, that part of the forward pass should match how IDM-VTON actually
-expects to be driven.
+https://github.com/yisol/IDM-VTON), not guessed, so if the frozen base pipeline loads and
+the dataset's columns resolve correctly, that part of the forward pass should match how
+IDM-VTON actually expects to be driven. The most likely real-run failure points are (a) a
+GarmentCodeVTONDataset column-name mismatch (see fit_datasets.py --inspect) and (b) shapes/
+dtypes that only reveal themselves against the real IDM-VTON pipeline and real images,
+neither of which were available to test against here.
 
 Design decision (invented -- not from the paper, which doesn't specify its training
 recipe at the abstract level available here): freeze the *entire* base IDM-VTON pipeline
@@ -30,10 +31,21 @@ itself (see its own frozen list: vae, text_encoder(_2), image_encoder, unet_enco
 
 Two losses (also invented -- the paper's actual loss terms/weights aren't available):
   - `layout_loss`: BCE between the layout generator's predicted fit-adjusted mask and a
-    ground-truth one (needs Fit4Men-style per-sample fit-adjusted mask labels).
+    ground-truth one. For GarmentCodeVTON, the "ground truth" is derived at batch-prep
+    time by running IDM-VTON's own mask stage on the *fitted-result* image instead of
+    the pre-garment avatar (see prepare_batch()'s docstring for why) -- not an official
+    label, a mechanically-grounded proxy for one.
   - `diffusion_loss`: the same noise-prediction MSE IDM-VTON itself trains with, computed
     with FitControler's injector attached to the frozen main unet -- gradients flow back
     only into FitControler's parameters, everything else stays frozen.
+
+Usage:
+    python scripts/download_dataset.py                 # one-time: pulls GarmentCodeVTON
+    python train.py --output-dir checkpoints            # trains against it
+
+Fit4Men itself (if you have real access to it, or another dataset in the same shape) is
+still supported via --dataset fit4men --data-root <path> -- see Fit4MenDataset below,
+which remains a documented format stub (Fit4Men isn't public).
 """
 from __future__ import annotations
 
@@ -45,6 +57,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms.functional import to_pil_image, to_tensor
 
 REPO_ROOT = Path(__file__).resolve().parent
 IDM_VTON_DIR = REPO_ROOT.parent / "idm-vton"
@@ -54,6 +67,7 @@ for p in (IDM_VTON_DIR, REPO_ROOT):
 
 import inference as idm_vton_inference  # noqa: E402
 from model import FitControler, FitControlerConfig, build_garment_agnostic_input  # noqa: E402
+from fit_datasets import GarmentCodeVTONDataset, parse_fit_level_from_text, raw_collate  # noqa: E402
 
 
 @dataclass
@@ -97,6 +111,88 @@ class Fit4MenDataset(Dataset):
             "this against your own fit-labeled data, producing the fields documented on "
             "Fit4MenSample. See fitcontroler/README.md for what each field is for."
         )
+
+
+def prepare_batch(
+    pipeline: "idm_vton_inference.IDMVTONPipeline",
+    raw_batch: list,
+) -> Fit4MenSample:
+    """Turns a list of GarmentCodeVTONDataset raw samples (dicts of PIL images + text,
+    see fit_datasets.py) into a Fit4MenSample batch, by running IDM-VTON's own
+    preprocessing on each sample -- the same building blocks
+    idm-vton/inference.py's run_tryon() uses (human parsing, OpenPose, DensePose, prompt
+    encoding), just called directly here instead of through the CLI pipeline.
+
+    `target_layout` (what FitAwareLayoutGenerator is supervised against) is derived by
+    running the SAME mask stage (get_mask_location) on the *fitted result* image, not
+    the pre-garment avatar: get_mask_location's output there traces how far the parsing
+    model sees "upper-clothes" pixels extending on the body under that specific
+    simulated fit -- wider for a loose garment, narrower for a tight one -- which is a
+    mechanically-grounded proxy for a "ground-truth fit-adjusted layout." It is NOT a
+    verified match for how Fit4Men itself was actually annotated (unknown, unreleased).
+    """
+    from utils_mask import get_mask_location  # resolved via idm-vton's sys.path setup
+
+    device, dtype = pipeline.device, pipeline.dtype
+    tt = pipeline.tensor_transform  # ToTensor + Normalize([0.5],[0.5]) -> ~[-1,1]
+
+    agnostic_images, default_masks, densepose_images = [], [], []
+    target_layouts, cloths, images, fit_levels = [], [], [], []
+    prompts, prompts_cloth = [], []
+
+    for sample in raw_batch:
+        avatar = sample["avatar_image"].resize((768, 1024))
+        garment = sample["garment_image"].resize((768, 1024))
+        result = sample["result_image"].resize((768, 1024))
+
+        keypoints = pipeline.openpose_model(avatar.resize((384, 512)))
+        model_parse, _ = pipeline.parsing_model(avatar.resize((384, 512)))
+        mask, mask_gray = get_mask_location("hd", "upper_body", model_parse, keypoints)
+        mask = mask.resize((768, 1024))
+        mask_gray_tensor = (1 - tt(mask)) * tt(avatar)
+        mask_gray_pil = to_pil_image((mask_gray_tensor + 1.0) / 2.0)
+
+        result_keypoints = pipeline.openpose_model(result.resize((384, 512)))
+        result_parse, _ = pipeline.parsing_model(result.resize((384, 512)))
+        layout_mask, _ = get_mask_location("hd", "upper_body", result_parse, result_keypoints)
+        layout_mask = layout_mask.resize((768, 1024))
+
+        pose_img = pipeline.run_densepose(avatar)
+
+        agnostic_images.append(tt(mask_gray_pil))
+        default_masks.append(to_tensor(mask))
+        densepose_images.append(tt(pose_img))
+        target_layouts.append(to_tensor(layout_mask))
+        cloths.append(tt(garment))
+        images.append(tt(result))
+        fit_levels.append(parse_fit_level_from_text(sample["fit_text"]))
+        prompts.append("model is wearing " + sample["fit_text"])
+        prompts_cloth.append("a photo of " + sample["fit_text"])
+
+    with torch.no_grad():
+        encoder_hidden_states, _, pooled_prompt_embeds, _ = pipeline.pipe.encode_prompt(
+            prompts, num_images_per_prompt=1, do_classifier_free_guidance=False,
+        )
+        text_embeds_cloth, _, _, _ = pipeline.pipe.encode_prompt(
+            prompts_cloth, num_images_per_prompt=1, do_classifier_free_guidance=False,
+        )
+
+    # Standard SDXL micro-conditioning (original_size, crop_top_left, target_size),
+    # fixed to the 768x1024 (width x height) this pipeline always resizes to.
+    add_time_ids = torch.tensor([[1024, 768, 0, 0, 1024, 768]] * len(raw_batch), device=device)
+
+    return Fit4MenSample(
+        image=torch.stack(images).to(device, dtype),
+        agnostic_image=torch.stack(agnostic_images).to(device, dtype),
+        default_mask=torch.stack(default_masks).to(device, dtype),
+        densepose_image=torch.stack(densepose_images).to(device, dtype),
+        target_layout=torch.stack(target_layouts).to(device, dtype),
+        fit_level=torch.tensor(fit_levels, device=device),
+        cloth=torch.stack(cloths).to(device, dtype),
+        text_embeds_cloth=text_embeds_cloth.to(device, dtype),
+        encoder_hidden_states=encoder_hidden_states.to(device, dtype),
+        unet_added_cond_kwargs={"text_embeds": pooled_prompt_embeds.to(device, dtype), "time_ids": add_time_ids},
+    )
 
 
 def training_step(
@@ -178,11 +274,25 @@ def freeze_base_pipeline(pipeline: "idm_vton_inference.IDMVTONPipeline") -> None
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data-root", required=True, help="path to your Fit4Men-format dataset (see Fit4MenDataset)")
+    parser.add_argument(
+        "--dataset", choices=["garmentcode_vton", "fit4men"], default="garmentcode_vton",
+        help="garmentcode_vton (default): huggingface.co/datasets/ZenoNing/GarmentCodeVTONDataset, "
+             "downloaded via scripts/download_dataset.py. fit4men: the paper's own dataset "
+             "format -- NOT public, requires --data-root pointing at your own data and a real "
+             "Fit4MenDataset implementation (see that class's docstring).",
+    )
+    parser.add_argument(
+        "--data-dir", default="data/garmentcode_vton",
+        help="[garmentcode_vton] local dir written by scripts/download_dataset.py "
+             "(load_from_disk); falls back to downloading via the HF cache if missing",
+    )
+    parser.add_argument("--split", default="train", help="[garmentcode_vton] dataset split")
+    parser.add_argument("--data-root", default=None, help="[fit4men] path to your Fit4Men-format dataset")
     parser.add_argument("--model-path", default="yisol/IDM-VTON")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", default="checkpoints")
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--layout-loss-weight", type=float, default=1.0)
@@ -194,10 +304,21 @@ def parse_args():
 def main() -> None:
     args = parse_args()
 
-    dataset = Fit4MenDataset(args.data_root)  # raises FileNotFoundError until you point
-    # this at real data, and __getitem__/__len__ raise NotImplementedError until you
-    # implement them -- see the class docstring.
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    if args.dataset == "garmentcode_vton":
+        dataset = GarmentCodeVTONDataset(split=args.split, data_dir=args.data_dir)
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.num_workers, collate_fn=raw_collate,
+        )
+        needs_prepare_batch = True
+    else:
+        if not args.data_root:
+            raise SystemExit("--dataset fit4men requires --data-root <path to your data>")
+        dataset = Fit4MenDataset(args.data_root)  # raises FileNotFoundError until you point
+        # this at real data, and __getitem__/__len__ raise NotImplementedError until you
+        # implement them -- see the class docstring.
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        needs_prepare_batch = False
 
     pipeline = idm_vton_inference.IDMVTONPipeline(args.model_path, args.device)
     freeze_base_pipeline(pipeline)
@@ -211,7 +332,9 @@ def main() -> None:
 
     step = 0
     for epoch in range(args.epochs):
-        for batch in loader:
+        for raw_batch in loader:
+            batch = prepare_batch(pipeline, raw_batch) if needs_prepare_batch else raw_batch
+
             optimizer.zero_grad()
             losses = training_step(
                 pipeline, fit_controler, batch,
