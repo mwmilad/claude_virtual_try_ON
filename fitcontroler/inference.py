@@ -44,7 +44,7 @@ from _idm_vton import load as _load_idm_vton_inference  # noqa: E402
 
 idm_vton_inference = _load_idm_vton_inference()
 from model import FIT_LEVELS, FitControler, fit_level_to_index  # noqa: E402
-from hooks import make_conditioning_hook  # noqa: E402
+from hooks import EXISTING_CKPT_DIR_HELP, make_conditioning_hook, resolve_model_path_and_cache  # noqa: E402
 
 
 def resolve_user_path(p: str) -> Path:
@@ -69,6 +69,7 @@ def parse_args():
         "--model-path", default="yisol/IDM-VTON",
         help="IDM-VTON base checkpoint -- see ../idm-vton/README.md",
     )
+    parser.add_argument("--existing-ckpt-dir", default=None, help=EXISTING_CKPT_DIR_HELP)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-type", choices=["hd", "dc"], default="hd")
     parser.add_argument("--category", choices=["upper_body", "lower_body", "dresses"], default="upper_body")
@@ -94,13 +95,12 @@ def main() -> None:
             stacklevel=1,
         )
 
-    model_path = args.model_path
-    if not Path(model_path).is_absolute():
-        candidate = resolve_user_path(model_path)
-        if candidate.is_dir():
-            model_path = str(candidate)
-
-    pipeline = idm_vton_inference.IDMVTONPipeline(model_path, args.device)
+    model_path, cache_dir, local_files_only = resolve_model_path_and_cache(
+        args, idm_vton_inference, resolve_user_path
+    )
+    pipeline = idm_vton_inference.IDMVTONPipeline(
+        model_path, args.device, cache_dir=cache_dir, local_files_only=local_files_only
+    )
 
     if args.weights is not None:
         fit_controler = FitControler.load(resolve_user_path(args.weights), map_location=args.device)

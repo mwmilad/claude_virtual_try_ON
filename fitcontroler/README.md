@@ -77,7 +77,14 @@ of the paper's actual design or numbers.
   `inference.py`; a plain `import inference` with both directories on `sys.path` (which
   an earlier version of this code did) silently resolves to whichever one `sys.path`
   lists first — caught here via a self-import smoke test, where it turned out to be
-  grabbing itself instead of IDM-VTON's pipeline.
+  grabbing itself instead of IDM-VTON's pipeline. A related fix: loading
+  `idm-vton/inference.py` `chdir()`s the process into `third_party/IDM-VTON` as a side
+  effect, so `train.py` now defines its own `resolve_user_path()` (mirroring
+  `inference.py`'s) and resolves every user-supplied path (`--output-dir`, `--data-dir`,
+  `--data-root`, `--sample-dir`, `--existing-ckpt-dir`) through it — an earlier version
+  resolved them against that chdir'd cwd instead, so e.g. the default `--output-dir
+  checkpoints` would silently have written into `idm-vton/third_party/IDM-VTON/checkpoints`
+  rather than `fitcontroler/checkpoints`.
 - `fit_datasets.py` — loads a real, downloadable dataset (**GarmentCodeVTON**, see
   "Dataset" below) as a stand-in for the paper's own unreleased Fit4Men.
 - `scripts/download_dataset.py` — downloads it (`huggingface.co/datasets/ZenoNing/GarmentCodeVTONDataset`,
@@ -119,6 +126,12 @@ python inference.py \
 
 `--fit` accepts `tight`, `fitted`, `regular`, `loose`, `oversized` (see caveat above:
 this vocabulary is invented, not from the paper).
+
+Already have IDM-VTON's checkpoints downloaded somewhere (densepose/humanparsing/openpose
++ a `models--yisol--IDM-VTON` Hugging Face cache entry, as siblings in one directory)?
+Add `--existing-ckpt-dir /path/to/it` to skip downloading entirely — same flag, same
+directory layout, on both `inference.py` and `train.py` here as on
+[`../idm-vton/inference.py`](../idm-vton/README.md#already-have-these-checkpoints-somewhere).
 
 ## Dataset
 
@@ -180,8 +193,11 @@ This downloads via the `datasets` library's own caching
 ## Training
 
 ```bash
-python train.py --output-dir checkpoints
+python train.py --output-dir checkpoints --existing-ckpt-dir /path/to/existing/idm-vton/ckpt
 ```
+
+(Omit `--existing-ckpt-dir` to download IDM-VTON fresh via the Hub instead — see
+`../idm-vton/README.md`.)
 
 Defaults to `--dataset garmentcode_vton --data-dir data/garmentcode_vton` (the directory
 `scripts/download_dataset.py` just populated; falls back to downloading straight from the

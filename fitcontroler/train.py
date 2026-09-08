@@ -81,7 +81,18 @@ from _idm_vton import load as _load_idm_vton_inference  # noqa: E402
 idm_vton_inference = _load_idm_vton_inference()
 from model import FIT_LEVELS, FitControler, FitControlerConfig, build_garment_agnostic_input  # noqa: E402
 from fit_datasets import GarmentCodeVTONDataset, parse_fit_level_from_text, raw_collate  # noqa: E402
-from hooks import make_conditioning_hook  # noqa: E402
+from hooks import EXISTING_CKPT_DIR_HELP, make_conditioning_hook, resolve_model_path_and_cache  # noqa: E402
+
+
+def resolve_user_path(p: str) -> Path:
+    """Loading idm_vton_inference (above) chdirs the process into
+    third_party/IDM-VTON as a side effect (see idm-vton/inference.py) -- every
+    user-supplied relative path (--data-dir, --data-root, --output-dir, --sample-dir,
+    --existing-ckpt-dir, a local --model-path) needs resolving against where the user
+    actually invoked `python train.py` from, not that chdir'd cwd. Mirrors
+    inference.py's own resolve_user_path."""
+    path = Path(p)
+    return path if path.is_absolute() else (idm_vton_inference.INVOCATION_DIR / path)
 
 
 @dataclass
@@ -374,6 +385,7 @@ def parse_args():
     parser.add_argument("--split", default="train", help="[garmentcode_vton] dataset split")
     parser.add_argument("--data-root", default=None, help="[fit4men] path to your Fit4Men-format dataset")
     parser.add_argument("--model-path", default="yisol/IDM-VTON")
+    parser.add_argument("--existing-ckpt-dir", default=None, help=EXISTING_CKPT_DIR_HELP)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", default="checkpoints")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -401,7 +413,10 @@ def main() -> None:
     args = parse_args()
 
     if args.dataset == "garmentcode_vton":
-        dataset = GarmentCodeVTONDataset(split=args.split, data_dir=args.data_dir)
+        # data_dir defaults to a relative path (data/garmentcode_vton) -- resolve it
+        # against the invocation dir, same reasoning as resolve_user_path's docstring.
+        data_dir = str(resolve_user_path(args.data_dir)) if args.data_dir else None
+        dataset = GarmentCodeVTONDataset(split=args.split, data_dir=data_dir)
         loader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=True,
             num_workers=args.num_workers, collate_fn=raw_collate,
@@ -413,9 +428,9 @@ def main() -> None:
     else:
         if not args.data_root:
             raise SystemExit("--dataset fit4men requires --data-root <path to your data>")
-        dataset = Fit4MenDataset(args.data_root)  # raises FileNotFoundError until you point
-        # this at real data, and __getitem__/__len__ raise NotImplementedError until you
-        # implement them -- see the class docstring.
+        dataset = Fit4MenDataset(str(resolve_user_path(args.data_root)))  # raises
+        # FileNotFoundError until you point this at real data, and __getitem__/__len__
+        # raise NotImplementedError until you implement them -- see the class docstring.
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         needs_prepare_batch = False
         if not args.no_epoch_samples:
@@ -426,16 +441,21 @@ def main() -> None:
             )
         visualization_sample = None
 
-    pipeline = idm_vton_inference.IDMVTONPipeline(args.model_path, args.device)
+    model_path, cache_dir, local_files_only = resolve_model_path_and_cache(
+        args, idm_vton_inference, resolve_user_path
+    )
+    pipeline = idm_vton_inference.IDMVTONPipeline(
+        model_path, args.device, cache_dir=cache_dir, local_files_only=local_files_only
+    )
     freeze_base_pipeline(pipeline)
 
     fit_controler = FitControler(FitControlerConfig()).to(args.device)
     fit_controler.train()
     optimizer = torch.optim.AdamW(fit_controler.parameters(), lr=args.lr)
 
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_user_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    sample_dir = Path(args.sample_dir) if args.sample_dir else output_dir / "samples"
+    sample_dir = resolve_user_path(args.sample_dir) if args.sample_dir else output_dir / "samples"
 
     step = 0
     for epoch in range(args.epochs):

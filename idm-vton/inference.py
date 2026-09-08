@@ -103,23 +103,80 @@ def pil_to_binary_mask(pil_image: Image.Image, threshold: int = 0) -> Image.Imag
     return Image.fromarray(mask)
 
 
+def link_existing_preprocessing_ckpt(existing_dir: Path) -> None:
+    """Points IDM-VTON's hardcoded `ckpt/` lookups (upstream's Parsing/OpenPose classes
+    and the DensePose 'show' action -- see README.md, "Download checkpoints") at an
+    already-downloaded directory instead of re-downloading, by symlinking
+    third_party/IDM-VTON/ckpt -> existing_dir. existing_dir is expected to directly
+    contain densepose/, humanparsing/, openpose/ subdirectories (i.e. the same layout
+    scripts/download_checkpoints.py would have produced) -- pass its parent if your
+    actual densepose/humanparsing/openpose live one level deeper than that.
+    """
+    target = IDM_VTON_SRC / "ckpt"
+    if target.is_symlink() and target.resolve() == existing_dir.resolve():
+        pass  # already linked correctly
+    elif target.exists():
+        print(
+            f"note: {target} already exists and isn't a symlink to {existing_dir} -- "
+            "leaving it as-is rather than overwriting; remove it yourself first if you "
+            "want --existing-ckpt-dir to take over."
+        )
+        return
+    else:
+        target.symlink_to(existing_dir, target_is_directory=True)
+        print(f"linked {target} -> {existing_dir}")
+
+    expected = [
+        existing_dir / "densepose" / "model_final_162be9.pkl",
+        existing_dir / "humanparsing" / "parsing_atr.onnx",
+        existing_dir / "humanparsing" / "parsing_lip.onnx",
+        existing_dir / "openpose" / "ckpts" / "body_pose_model.pth",
+    ]
+    missing = [str(p) for p in expected if not p.exists()]
+    if missing:
+        print(
+            "warning: --existing-ckpt-dir is missing some files IDM-VTON expects "
+            "(this may still work if your layout differs slightly, but a downstream "
+            "FileNotFoundError likely means one of these is really missing):"
+        )
+        for p in missing:
+            print(f"  {p}")
+
+
 class IDMVTONPipeline:
     """Loads the model once; mirrors the module-level setup block of gradio_demo/app.py."""
 
-    def __init__(self, model_path: str, device: str, dtype=torch.float16):
+    def __init__(
+        self,
+        model_path: str,
+        device: str,
+        dtype=torch.float16,
+        cache_dir: str | None = None,
+        local_files_only: bool = False,
+    ):
+        """
+        cache_dir / local_files_only: pass these when `model_path` is a bare repo id
+        ("yisol/IDM-VTON", the default) but you already have it in a local Hugging Face
+        cache (e.g. a `models--yisol--IDM-VTON/` directory from an earlier
+        snapshot_download or from_pretrained call) and want `from_pretrained` to resolve
+        it from there -- cache_dir points at the directory *containing* that
+        `models--...` folder, and local_files_only=True stops it from ever hitting the
+        network, even to just check for updates. See --existing-ckpt-dir in main() below.
+        """
         self.device = device
         self.dtype = dtype
+        hf_kwargs = {"cache_dir": cache_dir, "local_files_only": local_files_only}
 
-        unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=dtype)
+        unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=dtype, **hf_kwargs)
         unet.requires_grad_(False)
-        tokenizer_one = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", revision=None, use_fast=False)
-        tokenizer_two = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", revision=None, use_fast=False)
-        noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
-        text_encoder_one = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=dtype)
-        text_encoder_two = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=dtype)
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(model_path, subfolder="image_encoder", torch_dtype=dtype)
-        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=dtype)
-        unet_encoder = UNet2DConditionModel_ref.from_pretrained(model_path, subfolder="unet_encoder", torch_dtype=dtype)
+        tokenizer_one = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", revision=None, use_fast=False, **hf_kwargs)
+        tokenizer_two = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", revision=None, use_fast=False, **hf_kwargs)
+        noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler", **hf_kwargs)
+        text_encoder_one = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=dtype, **hf_kwargs)
+        text_encoder_two = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=dtype, **hf_kwargs)
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(model_path, subfolder="image_encoder", torch_dtype=dtype, **hf_kwargs)
+        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", torch_dtype=dtype, **hf_kwargs)
+        unet_encoder = UNet2DConditionModel_ref.from_pretrained(model_path, subfolder="unet_encoder", torch_dtype=dtype, **hf_kwargs)
 
         for m in (unet_encoder, image_encoder, vae, unet, text_encoder_one, text_encoder_two):
             m.requires_grad_(False)
@@ -143,6 +200,7 @@ class IDMVTONPipeline:
             scheduler=noise_scheduler,
             image_encoder=image_encoder,
             torch_dtype=dtype,
+            **hf_kwargs,
         )
         self.pipe.unet_encoder = unet_encoder
 
@@ -305,6 +363,18 @@ def parse_args():
         help="local checkpoints dir (scripts/download_checkpoints.py's checkpoints/IDM-VTON) "
              "or a bare HF repo id to load straight from the Hub (default)",
     )
+    parser.add_argument(
+        "--existing-ckpt-dir", default=None,
+        help="path to a directory you've already populated yourself (e.g. by running "
+             "scripts/download_checkpoints.py elsewhere, or any prior snapshot_download) "
+             "containing densepose/, humanparsing/, openpose/ AND a "
+             "models--yisol--IDM-VTON/ Hugging Face cache entry as siblings -- skips all "
+             "downloading. Symlinks third_party/IDM-VTON/ckpt to it for the "
+             "preprocessing weights, and passes it as cache_dir with "
+             "local_files_only=True for the model weights (leave --model-path at its "
+             "default 'yisol/IDM-VTON' repo id when using this -- it resolves from the "
+             "cache, not the Hub).",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--model-type", choices=["hd", "dc"], default="hd",
@@ -341,7 +411,19 @@ def main() -> None:
         if candidate.is_dir():
             model_path = str(candidate)
 
-    pipeline = IDMVTONPipeline(model_path, args.device)
+    cache_dir = None
+    local_files_only = False
+    if args.existing_ckpt_dir:
+        existing_dir = resolve_user_path(args.existing_ckpt_dir)
+        if not existing_dir.is_dir():
+            raise SystemExit(f"--existing-ckpt-dir {existing_dir} does not exist or isn't a directory")
+        link_existing_preprocessing_ckpt(existing_dir)
+        cache_dir = str(existing_dir)
+        local_files_only = True
+
+    pipeline = IDMVTONPipeline(
+        model_path, args.device, cache_dir=cache_dir, local_files_only=local_files_only
+    )
 
     person_img = Image.open(resolve_user_path(args.person))
     garm_img = Image.open(resolve_user_path(args.garment))

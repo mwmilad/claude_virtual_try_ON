@@ -85,6 +85,41 @@ Neither repo appeared gated as of when this was written — no `huggingface-cli 
 should be required, but if you hit a 403, request access on the relevant repo page and
 authenticate first.
 
+### Already have these checkpoints somewhere?
+
+If you've already downloaded IDM-VTON on this machine (e.g. via this same
+`download_checkpoints.py` run elsewhere, or any earlier `snapshot_download`/
+`from_pretrained` call), you don't need to fetch it again. `--existing-ckpt-dir` expects
+one directory containing, as direct siblings:
+
+```
+<existing-ckpt-dir>/
+├── densepose/          # -> symlinked to third_party/IDM-VTON/ckpt/densepose
+├── humanparsing/        # -> symlinked to third_party/IDM-VTON/ckpt/humanparsing
+├── openpose/             # -> symlinked to third_party/IDM-VTON/ckpt/openpose
+└── models--yisol--IDM-VTON/    # a standard Hugging Face cache entry (from
+                                  # snapshot_download/from_pretrained caching to this dir)
+```
+
+```bash
+python inference.py \
+  --existing-ckpt-dir /path/to/existing/ckpt \
+  --person examples/person.jpg \
+  --garment examples/garment.jpg \
+  --garment-desc "short sleeve round neck t-shirt" \
+  --output out.png
+```
+
+This symlinks `third_party/IDM-VTON/ckpt` to the `densepose`/`humanparsing`/`openpose`
+subfolders (skipping `scripts/download_checkpoints.py` entirely for those), and passes
+your directory as `cache_dir` with `local_files_only=True` to every `from_pretrained`
+call for the model weights — so it resolves `models--yisol--IDM-VTON` from your local
+cache and never touches the network, even to check for updates. Leave `--model-path` at
+its default `yisol/IDM-VTON` repo id when using this (that's the id `from_pretrained`
+looks up inside the cache — it isn't a literal filesystem path here). If your directory
+is missing any of the four expected files, `inference.py` prints which ones before
+proceeding (not a hard failure — your layout might just differ slightly).
+
 ## 3. Run inference
 
 ```bash
@@ -114,6 +149,8 @@ Other flags:
   values.
 - `--model-path` — defaults to the bare HF repo id `yisol/IDM-VTON` (loads straight from
   the Hub); point it at `checkpoints/IDM-VTON` to use the local download instead.
+- `--existing-ckpt-dir` — skip downloading entirely by pointing at checkpoints you
+  already have (see "Already have these checkpoints somewhere?" above).
 - `--save-mask path/to/mask_preview.png` — also save the grayed-out mask preview.
 
 ## Troubleshooting
