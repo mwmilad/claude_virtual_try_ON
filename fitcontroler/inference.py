@@ -30,51 +30,26 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from torchvision.transforms.functional import to_tensor
 
 REPO_ROOT = Path(__file__).resolve().parent
-IDM_VTON_DIR = REPO_ROOT.parent / "idm-vton"
-if str(IDM_VTON_DIR) not in sys.path:
-    sys.path.insert(0, str(IDM_VTON_DIR))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# INVOCATION_DIR is captured (and cwd changed to third_party/IDM-VTON) as a side effect
-# of importing idm-vton's inference module -- see idm-vton/inference.py.
-import inference as idm_vton_inference  # noqa: E402
-from model import (  # noqa: E402
-    FIT_LEVELS,
-    FitControler,
-    build_garment_agnostic_input,
-    fit_level_to_index,
-)
+# Loaded by explicit file path, not `import inference` -- both idm-vton/ and this
+# directory have their own inference.py, and a plain `import inference` here would
+# ambiguously resolve to whichever one sys.path lists first (see _idm_vton.py). It's
+# still true that INVOCATION_DIR is captured (and cwd changed to third_party/IDM-VTON)
+# as a side effect of loading it -- see idm-vton/inference.py.
+from _idm_vton import load as _load_idm_vton_inference  # noqa: E402
+
+idm_vton_inference = _load_idm_vton_inference()
+from model import FIT_LEVELS, FitControler, fit_level_to_index  # noqa: E402
+from hooks import make_conditioning_hook  # noqa: E402
 
 
 def resolve_user_path(p: str) -> Path:
     path = Path(p)
     return path if path.is_absolute() else (idm_vton_inference.INVOCATION_DIR / path)
-
-
-def make_conditioning_hook(fit_controler: FitControler, unet, fit_level_idx: int, device: str, dtype):
-    """Returns the on_conditioning_ready callback IDMVTONPipeline.run_tryon() invokes
-    right after it has computed mask/pose_img/mask_gray -- builds the garment-agnostic
-    representation from those same outputs (see model.build_garment_agnostic_input's
-    docstring for why these specific pieces) and attaches the plug-in's injector hooks
-    onto the base pipeline's UNet before the diffusion pass runs."""
-
-    def _hook(conditioning: dict) -> None:
-        tt = conditioning["tensor_transform"]  # ToTensor + Normalize([0.5],[0.5]) -> ~[-1,1]
-        mask_t = to_tensor(conditioning["mask"])[:1]  # keep raw [0,1] range, single channel
-        agnostic_repr = build_garment_agnostic_input(
-            agnostic_image=tt(conditioning["mask_gray"]).unsqueeze(0).to(device, dtype),
-            default_mask=mask_t.unsqueeze(0).to(device, dtype),
-            densepose_image=tt(conditioning["pose_img"]).unsqueeze(0).to(device, dtype),
-        )
-        fit_level = torch.tensor([fit_level_idx], device=device)
-        fit_controler.prepare(agnostic_repr, fit_level)
-        fit_controler.attach(unet)
-
-    return _hook
 
 
 def parse_args():

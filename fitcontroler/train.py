@@ -46,6 +46,16 @@ Usage:
 Fit4Men itself (if you have real access to it, or another dataset in the same shape) is
 still supported via --dataset fit4men --data-root <path> -- see Fit4MenDataset below,
 which remains a documented format stub (Fit4Men isn't public).
+
+Per-epoch sample grid: unless --no-epoch-samples is passed, the end of every epoch runs
+a fixed (avatar, garment) pair through the current FitControler checkpoint once per fit
+level (model.FIT_LEVELS -- 5 by default: tight/fitted/regular/loose/oversized), stitches
+the 5 results into one labeled image, and saves it to <output-dir>/samples/epoch_NNN.png
+-- a quick visual read on whether the plug-in is learning to differentiate fits at all,
+without needing an eval harness. See save_epoch_sample_grid() below. Only implemented
+for --dataset garmentcode_vton (it needs a raw PIL/text sample; Fit4MenDataset's stub
+returns preprocessed tensors, not that, so sampling is skipped with a note for
+--dataset fit4men).
 """
 from __future__ import annotations
 
@@ -56,18 +66,22 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms.functional import to_pil_image, to_tensor
 
 REPO_ROOT = Path(__file__).resolve().parent
-IDM_VTON_DIR = REPO_ROOT.parent / "idm-vton"
-for p in (IDM_VTON_DIR, REPO_ROOT):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-import inference as idm_vton_inference  # noqa: E402
-from model import FitControler, FitControlerConfig, build_garment_agnostic_input  # noqa: E402
+# Loaded by explicit file path, not `import inference` -- see _idm_vton.py's docstring
+# for the real bug (a self-import via sys.path ordering) this sidesteps.
+from _idm_vton import load as _load_idm_vton_inference  # noqa: E402
+
+idm_vton_inference = _load_idm_vton_inference()
+from model import FIT_LEVELS, FitControler, FitControlerConfig, build_garment_agnostic_input  # noqa: E402
 from fit_datasets import GarmentCodeVTONDataset, parse_fit_level_from_text, raw_collate  # noqa: E402
+from hooks import make_conditioning_hook  # noqa: E402
 
 
 @dataclass
@@ -272,6 +286,77 @@ def freeze_base_pipeline(pipeline: "idm_vton_inference.IDMVTONPipeline") -> None
         module.eval()
 
 
+def save_epoch_sample_grid(
+    pipeline: "idm_vton_inference.IDMVTONPipeline",
+    fit_controler: FitControler,
+    sample: dict,
+    epoch: int,
+    output_dir: Path,
+    steps: int = 20,
+    guidance_scale: float = 2.0,
+) -> Path:
+    """Runs one fixed (avatar, garment) pair through the current FitControler once per
+    fit level (len(FIT_LEVELS) == 5 by default: tight/fitted/regular/loose/oversized),
+    holding the prompt, seed, and everything else constant -- only the injected fit
+    conditioning differs between panels -- and stitches the results into one labeled
+    image. `sample` is a raw GarmentCodeVTONDataset item (avatar_image, garment_image,
+    fit_text); the SAME sample should be passed every epoch (pick it once before the
+    training loop) so panels are comparable across epoch_NNN.png files over time.
+
+    Runs a full multi-step diffusion sample each call (via IDMVTONPipeline.run_tryon),
+    unlike training_step()'s single noisy-timestep loss -- this is meaningfully slower
+    than one training step; keep `steps` modest (default 20) since this happens once per
+    epoch, not per training step.
+    """
+    was_training = fit_controler.training
+    fit_controler.eval()
+
+    panels = []
+    try:
+        with torch.no_grad():
+            for fit_name in FIT_LEVELS:
+                fit_idx = FIT_LEVELS.index(fit_name)
+                hook = make_conditioning_hook(
+                    fit_controler, pipeline.pipe.unet, fit_idx, pipeline.device, pipeline.dtype
+                )
+                try:
+                    result, _ = pipeline.run_tryon(
+                        person_img=sample["avatar_image"],
+                        garm_img=sample["garment_image"],
+                        garment_desc=sample["fit_text"],
+                        model_type="hd",
+                        category="upper_body",
+                        auto_mask=True,
+                        user_mask=None,
+                        crop=False,
+                        denoise_steps=steps,
+                        guidance_scale=guidance_scale,
+                        # fixed seed across panels/epochs -- isolates the effect of
+                        # FitControler's fit conditioning from ordinary sampling noise
+                        seed=0,
+                        on_conditioning_ready=hook,
+                    )
+                finally:
+                    fit_controler.detach()
+                panels.append((fit_name, result))
+    finally:
+        if was_training:
+            fit_controler.train()
+
+    label_h = 28
+    panel_w, panel_h = panels[0][1].size
+    grid = Image.new("RGB", (panel_w * len(panels), panel_h + label_h), "white")
+    draw = ImageDraw.Draw(grid)
+    for i, (fit_name, img) in enumerate(panels):
+        grid.paste(img, (i * panel_w, label_h))
+        draw.text((i * panel_w + 8, 6), f"epoch {epoch} - {fit_name}", fill="black")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"epoch_{epoch:03d}.png"
+    grid.save(out_path)
+    return out_path
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -298,6 +383,17 @@ def parse_args():
     parser.add_argument("--layout-loss-weight", type=float, default=1.0)
     parser.add_argument("--diffusion-loss-weight", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=1000, help="steps between checkpoints")
+    parser.add_argument(
+        "--no-epoch-samples", action="store_true",
+        help="disable the end-of-epoch sample grid (see save_epoch_sample_grid()) -- "
+             "on by default, garmentcode_vton only",
+    )
+    parser.add_argument(
+        "--sample-dir", default=None,
+        help="where to save epoch sample grids (default: <output-dir>/samples)",
+    )
+    parser.add_argument("--sample-steps", type=int, default=20, help="denoising steps for epoch samples (kept low -- runs 5x per epoch)")
+    parser.add_argument("--sample-guidance-scale", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -311,6 +407,9 @@ def main() -> None:
             num_workers=args.num_workers, collate_fn=raw_collate,
         )
         needs_prepare_batch = True
+        # Fixed once, up front, so every epoch_NNN.png uses the SAME (avatar, garment)
+        # pair -- otherwise panels across epochs wouldn't be comparable.
+        visualization_sample = dataset[0] if not args.no_epoch_samples else None
     else:
         if not args.data_root:
             raise SystemExit("--dataset fit4men requires --data-root <path to your data>")
@@ -319,6 +418,13 @@ def main() -> None:
         # implement them -- see the class docstring.
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         needs_prepare_batch = False
+        if not args.no_epoch_samples:
+            print(
+                "note: epoch sample grids are only implemented for --dataset "
+                "garmentcode_vton (needs a raw PIL/text sample) -- skipping for fit4men. "
+                "Pass --no-epoch-samples to silence this."
+            )
+        visualization_sample = None
 
     pipeline = idm_vton_inference.IDMVTONPipeline(args.model_path, args.device)
     freeze_base_pipeline(pipeline)
@@ -329,6 +435,7 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir = Path(args.sample_dir) if args.sample_dir else output_dir / "samples"
 
     step = 0
     for epoch in range(args.epochs):
@@ -356,6 +463,13 @@ def main() -> None:
                 ckpt_path = output_dir / f"fitcontroler_step{step}.pt"
                 fit_controler.save(str(ckpt_path))
                 print(f"saved {ckpt_path}")
+
+        if visualization_sample is not None:
+            grid_path = save_epoch_sample_grid(
+                pipeline, fit_controler, visualization_sample, epoch, sample_dir,
+                steps=args.sample_steps, guidance_scale=args.sample_guidance_scale,
+            )
+            print(f"epoch {epoch} sample grid -> {grid_path}")
 
     fit_controler.save(str(output_dir / "fitcontroler_final.pt"))
 

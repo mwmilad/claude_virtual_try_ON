@@ -70,6 +70,14 @@ of the paper's actual design or numbers.
   extension point added to `idm-vton/inference.py`
   (`IDMVTONPipeline.run_tryon(..., on_conditioning_ready=...)`), so the plug-in reuses
   IDM-VTON's own mask/pose/DensePose outputs instead of recomputing them.
+- `hooks.py` — the `on_conditioning_ready` callback builder, shared by `inference.py` and
+  `train.py`'s per-epoch sample grids (see below) so there's one definition of it.
+- `_idm_vton.py` — loads `../idm-vton/inference.py` by explicit file path instead of
+  `import inference`. Both that file and this directory's own `inference.py` are named
+  `inference.py`; a plain `import inference` with both directories on `sys.path` (which
+  an earlier version of this code did) silently resolves to whichever one `sys.path`
+  lists first — caught here via a self-import smoke test, where it turned out to be
+  grabbing itself instead of IDM-VTON's pipeline.
 - `fit_datasets.py` — loads a real, downloadable dataset (**GarmentCodeVTON**, see
   "Dataset" below) as a stand-in for the paper's own unreleased Fit4Men.
 - `scripts/download_dataset.py` — downloads it (`huggingface.co/datasets/ZenoNing/GarmentCodeVTONDataset`,
@@ -192,6 +200,36 @@ wrote this) — the two most likely failure points on a first real run are (a) a
 shapes/dtypes that only reveal themselves against the real IDM-VTON pipeline and real
 images. Useful flags: `--batch-size`, `--num-workers`, `--lr`, `--epochs`,
 `--layout-loss-weight`, `--diffusion-loss-weight`, `--save-every`.
+
+### Watching training progress: per-epoch sample grids
+
+By default, the end of every epoch runs one fixed (avatar, garment) pair — picked once
+from the dataset before training starts, so it's the same pair every epoch — through the
+current `FitControler` checkpoint once per fit level (5 by default:
+`tight/fitted/regular/loose/oversized`), with the prompt and seed held constant across
+panels so only the injected fit conditioning differs, and stitches the 5 results into one
+labeled image:
+
+```
+checkpoints/samples/epoch_000.png
+checkpoints/samples/epoch_001.png
+...
+```
+
+Each is one row: the same garment on the same body, five ways. Since the injector is
+zero-init (see the "no-op" warning above), `epoch_000.png` should show five
+near-identical panels — if the panels visibly diverge by fit level as training
+progresses, that's your signal FitControler is actually learning to differentiate fits,
+without needing a real eval harness. This has been sanity-tested in isolation (the
+hook-wiring + image-stitching logic, with a mocked pipeline so it runs without a GPU) but
+not against real IDM-VTON output.
+
+Flags: `--no-epoch-samples` (disable), `--sample-dir` (default `<output-dir>/samples`),
+`--sample-steps` (default 20 — kept low since this runs 5 full diffusion samples every
+epoch, independent of the main `--steps`-less training loop, which never calls the full
+sampler), `--sample-guidance-scale`. Only implemented for `--dataset garmentcode_vton`
+(needs a raw PIL/text sample; `Fit4MenDataset`'s stub would need real data and a real
+`__getitem__` first) — skipped with a printed note for `--dataset fit4men`.
 
 To use Fit4Men itself (or an equivalent you have real access to) instead:
 ```bash
